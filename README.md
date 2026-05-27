@@ -70,6 +70,7 @@ In npm package settings, add a GitHub Actions trusted publisher with:
 - Organization or user: `jayjnu`
 - Repository: `pi-auto-review`
 - Workflow filename: `publish.yml`
+- Environment name: `npm-publish`
 - Allowed actions: `npm publish`
 
 Then publish a new version by updating `package.json`, committing, tagging, and pushing:
