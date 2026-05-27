@@ -43,6 +43,14 @@ At runtime:
 /auto-review status
 ```
 
+## Runtime Control
+
+`/auto-review status` shows whether automatic review is currently enabled.
+
+`/auto-review off` disables review for the current Pi session.
+
+`/auto-review on` enables review for the current Pi session unless Pi was started with `--no-auto-review` and you want to keep it disabled.
+
 ## Customizing Reviews
 
 Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, and package skills. The spawned reviewer is prompted to inspect and follow relevant skills and loaded context.
