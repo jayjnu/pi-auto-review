@@ -5,6 +5,12 @@ A Pi package that automatically runs a read-only code review after a Pi agent fi
 ## Install
 
 ```bash
+pi install npm:@jayjnu/pi-auto-review
+```
+
+For GitHub install without npm publishing:
+
+```bash
 pi install git:https://github.com/jayjnu/pi-auto-review.git
 ```
 

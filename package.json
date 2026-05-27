@@ -1,16 +1,25 @@
 {
-  "name": "pi-auto-review",
+  "name": "@jayjnu/pi-auto-review",
   "version": "0.1.0",
   "description": "Pi package that automatically runs a read-only code review after agent code changes.",
   "type": "module",
   "license": "MIT",
   "keywords": ["pi-package", "pi", "code-review", "agent"],
+  "files": [
+    "extensions/auto-review/*.ts",
+    "!extensions/auto-review/*.test.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions/auto-review/index.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
