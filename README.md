@@ -61,6 +61,26 @@ At runtime:
 
 Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, and package skills. The spawned reviewer is prompted to inspect and follow relevant skills and loaded context.
 
+## Trusted Publisher Release Setup
+
+This package includes `.github/workflows/publish.yml` for npm Trusted Publishing.
+
+In npm package settings, add a GitHub Actions trusted publisher with:
+
+- Organization or user: `jayjnu`
+- Repository: `pi-auto-review`
+- Workflow filename: `publish.yml`
+- Allowed actions: `npm publish`
+
+Then publish a new version by updating `package.json`, committing, tagging, and pushing:
+
+```bash
+npm version patch
+git push --follow-tags
+```
+
+The workflow uses GitHub OIDC (`id-token: write`) and does not require an `NPM_TOKEN` secret.
+
 ## Safety
 
 The reviewer subprocess receives only `read`, `grep`, `find`, `ls`, and `bash`. Its prompt instructs it to use bash for read-only commands only.
