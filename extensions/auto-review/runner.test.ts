@@ -25,6 +25,8 @@ describe('runReviewer', () => {
           const promptPath = args[args.indexOf('--append-system-prompt') + 1];
           const metaPrompt = await readFile(promptPath, 'utf8');
           expect(metaPrompt).toContain('automated post-change code reviewer');
+          expect(metaPrompt).toContain('## Skills Used');
+          expect(metaPrompt).toContain('Make your skill usage visible');
           return {
             stdout: JSON.stringify({
               type: 'message_end',
@@ -36,7 +38,7 @@ describe('runReviewer', () => {
         },
       });
 
-      expect(result).toEqual({ text: 'Looks good', stderr: '', code: 0 });
+      expect(result).toEqual({ text: '## Skills Used\n- Not reported by reviewer.\n\nLooks good', stderr: '', code: 0 });
       expect(calls).toHaveLength(1);
       expect(calls[0].command).toBe('pi');
       expect(calls[0].options.cwd).toBe('/repo');
@@ -58,6 +60,7 @@ describe('runReviewer', () => {
         exec: async () => ({ stdout: '', stderr: 'child failed', code: 1 }),
       });
 
+      expect(result.text).toContain('## Skills Used');
       expect(result.text).toContain('child failed');
       expect(result.code).toBe(1);
     } finally {
