@@ -584,6 +584,40 @@ describe('autoReviewExtension', () => {
     }
   });
 
+  it('drops queued review after custom reviewStartWatchdogMs when Pi never becomes idle', async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createFakePi(false);
+      const dir = createTempDir();
+      const ctx = createFakeContext();
+      ctx.cwd = dir;
+      ctx.isIdle.mockReturnValue(false);
+      fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: 5000 }));
+      pi.exec.mockImplementation(async (command: string, args: string[]) => {
+        if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+        if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      });
+
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.handlers.agent_start[0]({}, ctx);
+      await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+      await pi.handlers.agent_end[0]({}, ctx);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await pi.commands['auto-review'].handler('status', ctx);
+
+      expect(pi.sendUserMessage).not.toHaveBeenCalled();
+      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('runtime /auto-review off overrides config enabled', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();

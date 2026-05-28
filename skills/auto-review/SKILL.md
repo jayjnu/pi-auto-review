@@ -88,7 +88,7 @@ When the user says something like the following, translate it into the correspon
 | `reviewerTaskExtra` | string | `""` | Extra instructions appended to task |
 | `autoFix` | boolean | `true` | Allow Critical/Warning fixes after reviewer returns |
 | `autoFixSuggestions` | boolean | `false` | Allow automatic fixing of Suggestions |
-| `blockInputDuringReview` | boolean | `true` | Block user input during review |
+| `blockInputDuringReview` | boolean | `true` | Block user input while a review turn is queued but not yet dispatched |
 | `reviewStartWatchdogMs` | number | `30000` | Timeout before dropping a stuck queued review |
 | `maxReviewPasses` | number/null | `null` | Optional pass limit; `null`/`unlimited` means no limit |
 

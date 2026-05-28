@@ -66,6 +66,12 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   function startQueuedReviewWhenIdle(ctx: ExtensionContext): void {
     if (startingQueuedReview || reviewStartTimer) return;
 
+    const watchdogMs = config?.reviewStartWatchdogMs ?? 30_000;
+    reviewStartWatchdogTimer = setTimeout(() => {
+      clearQueuedReview();
+    }, watchdogMs);
+    reviewStartWatchdogTimer.unref?.();
+
     const tryStart = () => {
       reviewStartTimer = undefined;
       if (!reviewQueued || !queuedReviewPrompt) return;

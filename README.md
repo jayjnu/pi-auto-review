@@ -28,10 +28,10 @@ The package bundles `pi-subagents` and an `auto-review` skill. After Pi becomes 
 
 - review context is isolated in a child Pi session via `pi-subagents`;
 - fixes happen in the visible main chat flow;
-- the extension briefly blocks new user input while review/fix is queued or running;
+- the extension can briefly block new user input while a review turn is queued;
 - no custom background reviewer process is spawned by `pi-auto-review`.
 
-Before the reviewer subagent returns, the extension blocks `edit` and `write` tool calls and allows only read-only bash inspection commands as an extra guard. After the reviewer result returns, the main agent may apply fixes. If those fixes change files, `pi-auto-review` queues another review turn.
+The extension dispatches only the `/skill:auto-review` skill command and relies on the bundled skill plus `pi-subagents` for review/fix workflow discipline. If fixes change files, `pi-auto-review` queues another review turn.
 
 The package assumes Pi skill commands are enabled. Pi defaults `enableSkillCommands` to `true`; if your effective settings disable it, `pi-auto-review` shows a session-start warning asking you to set `"enableSkillCommands": true` in `~/.pi/agent/settings.json` or `.pi/settings.json`.
 
@@ -59,7 +59,7 @@ At runtime:
 
 ## Runtime Control
 
-`/auto-review status` shows whether automatic review is enabled, whether a review is idle/queued/running, and the current review pass count.
+`/auto-review status` shows whether automatic review is enabled, whether a review is idle or queued, and the completed/queued review pass count.
 
 `/auto-review off` disables review for the current Pi session.
 
@@ -113,7 +113,7 @@ Example config file:
 - `reviewerTaskExtra` — extra instructions appended to the reviewer task (default: `""`).
 - `autoFix` — allow the main agent to apply Critical/Warning fixes after the reviewer returns (default: `true`).
 - `autoFixSuggestions` — allow automatic fixing of Suggestions when safe and local (default: `false`). By default, Suggestions are report-only.
-- `blockInputDuringReview` — block new user messages while a review is queued or running (default: `true`).
+- `blockInputDuringReview` — block new user messages while a review turn is queued but not yet dispatched (default: `true`).
 - `reviewStartWatchdogMs` — timeout in ms before a stuck queued review is dropped (default: `30000`).
 - `maxReviewPasses` — optional review/fix pass limit for one review loop. Use `null`/`none`/`unlimited` for no limit (default: `null`).
 
@@ -125,4 +125,4 @@ Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skill
 
 ## Safety
 
-Before the reviewer subagent returns, the queued `/skill:auto-review` turn instructs the main agent not to modify files. The extension also blocks `edit` and `write` tool calls, and limits bash to read-only inspection commands. After the reviewer returns, the main agent can apply fixes for Critical/Warning findings.
+The queued `/skill:auto-review` turn instructs the main agent to keep inspection read-only until the reviewer subagent returns. The extension itself does not enforce per-tool mutation blocking; workflow discipline is handled by the skill instructions and `pi-subagents`. After the reviewer returns, the main agent can apply fixes for Critical/Warning findings.

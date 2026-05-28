@@ -27,7 +27,6 @@ export interface ReviewPromptInput {
   maxReviewPasses?: number | null;
 }
 
-export const AUTO_REVIEW_PROMPT_MARKER = '<!-- pi-auto-review-turn -->';
 export const AUTO_REVIEW_SKILL_COMMAND = '/skill:auto-review';
 
 const READ_ONLY_REVIEW_COMMANDS = new Set(['pwd', 'ls', 'grep', 'rg', 'cat', 'head', 'tail', 'wc']);
