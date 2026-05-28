@@ -18,6 +18,13 @@ export interface ReviewPromptInput {
   status: string;
   beforeHead?: string;
   afterHead?: string;
+  reviewerAgent: string;
+  reviewerSkills: string[];
+  reviewerTaskExtra?: string;
+  autoFix: boolean;
+  autoFixSuggestions: boolean;
+  reviewPass?: number;
+  maxReviewPasses?: number | null;
 }
 
 export const AUTO_REVIEW_PROMPT_MARKER = '<!-- pi-auto-review-turn -->';
@@ -50,18 +57,18 @@ export function isFileMutationToolResult(toolName: string, isError: boolean | un
   return toolName === 'edit' || toolName === 'write';
 }
 
-function isReviewerTask(value: unknown): boolean {
+function isReviewerTask(value: unknown, reviewerAgent = 'reviewer'): boolean {
   if (!value || typeof value !== 'object') return false;
   const task = value as { agent?: unknown; tasks?: unknown };
-  if (task.agent === 'reviewer') return true;
-  if (Array.isArray(task.tasks)) return task.tasks.length > 0 && task.tasks.every(isReviewerTask);
+  if (task.agent === reviewerAgent) return true;
+  if (Array.isArray(task.tasks)) return task.tasks.length > 0 && task.tasks.every((t) => isReviewerTask(t, reviewerAgent));
   return false;
 }
 
-export function isReviewerSubagentInput(input: Record<string, unknown> | undefined): boolean {
+export function isReviewerSubagentInput(input: Record<string, unknown> | undefined, reviewerAgent = 'reviewer'): boolean {
   if (!input) return false;
-  if (input.agent === 'reviewer') return true;
-  if (Array.isArray(input.tasks)) return input.tasks.length > 0 && input.tasks.every(isReviewerTask);
+  if (input.agent === reviewerAgent) return true;
+  if (Array.isArray(input.tasks)) return input.tasks.length > 0 && input.tasks.every((t) => isReviewerTask(t, reviewerAgent));
   return false;
 }
 
@@ -241,48 +248,6 @@ export function shouldRunReview(input: ReviewDecisionInput): boolean {
   return statusChanged || headChanged;
 }
 
-export function buildReviewPrompt(input: ReviewPromptInput): string {
-  const changedFiles = input.changedFiles.length > 0 ? input.changedFiles.map((file) => `- ${file}`).join('\n') : '- (no changed files parsed)';
-  const status = input.status.trim().length > 0 ? input.status.trim() : '(empty git status)';
-  const beforeHead = input.beforeHead?.trim() || '(unknown)';
-  const afterHead = input.afterHead?.trim() || '(unknown)';
-  const headChanged = beforeHead !== '(unknown)' && afterHead !== '(unknown)' && beforeHead !== afterHead;
-  const suggestedCommands = headChanged
-    ? [`git diff --no-ext-diff ${beforeHead}..${afterHead}`, 'git diff --no-ext-diff', 'git diff --cached --no-ext-diff']
-    : ['git diff --no-ext-diff', 'git diff --cached --no-ext-diff'];
-
-  return [
-    AUTO_REVIEW_SKILL_COMMAND,
-    '',
-    AUTO_REVIEW_PROMPT_MARKER,
-    'Review and fix the code changes from the previous turn.',
-    '',
-    'Use the current chat context and project instructions while orchestrating review/fix.',
-    'Before the reviewer result returns, use read-only inspection tools/commands only.',
-    '',
-    'Changed files:',
-    changedFiles,
-    '',
-    'Git status:',
-    '```text',
-    status,
-    '```',
-    '',
-    'HEAD range:',
-    `- before: ${beforeHead}`,
-    `- after: ${afterHead}`,
-    '',
-    'Suggested inspection commands:',
-    ...suggestedCommands.map((command) => `- \`${command}\``),
-    '',
-    'Report concrete findings with file paths and line numbers.',
-    '',
-    'Output format:',
-    '## Skills Used',
-    '## Summary',
-    '## Critical',
-    '## Warnings',
-    '## Suggestions',
-    '## Files Reviewed',
-  ].join('\n');
+export function buildReviewPrompt(_input: ReviewPromptInput): string {
+  return AUTO_REVIEW_SKILL_COMMAND;
 }

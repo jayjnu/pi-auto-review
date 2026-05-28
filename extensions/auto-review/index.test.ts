@@ -103,6 +103,19 @@ describe('autoReviewExtension', () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; state: idle', 'info');
   });
 
+  it('warns when runtime on cannot override no-auto-review flag', async () => {
+    const pi = createFakePi(true);
+    const ctx = createFakeContext();
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('on', ctx);
+    await pi.commands['auto-review'].handler('status', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review remains disabled because Pi was started with --no-auto-review', 'warning');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; state: idle', 'info');
+  });
+
   it('warns at session start when skill commands are disabled', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
@@ -148,13 +161,12 @@ describe('autoReviewExtension', () => {
     await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
     await pi.handlers.agent_end[0]({}, ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review queued', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review queued (pass 1)', 'info');
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
 
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining('/skill:auto-review'));
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining('src/index.ts'));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
   });
 
   it('queues a main-agent follow-up review for committed clean-worktree changes', async () => {
@@ -179,8 +191,7 @@ describe('autoReviewExtension', () => {
 
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining('git diff --no-ext-diff abc..def'));
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining('src/index.ts'));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
   });
 
   it('clears queued review state if starting the review turn fails', async () => {
@@ -233,7 +244,7 @@ describe('autoReviewExtension', () => {
 
       expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
       await pi.commands['auto-review'].handler('status', ctx);
-      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
+      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle; completed passes: 1', 'info');
     } finally {
       vi.useRealTimers();
     }
@@ -290,7 +301,7 @@ describe('autoReviewExtension', () => {
 
     expect(await pi.handlers.input[0]({ source: 'interactive', text: 'next task' }, ctx)).toEqual({ action: 'handled' });
     expect(await pi.handlers.input[0]({ source: 'extension', text: 'other extension message' }, ctx)).toEqual({ action: 'handled' });
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is queued. Please send your message after it completes.', 'warning');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is queued. Please send your message after it starts or press Esc to interrupt.', 'warning');
 
     ctx.isIdle.mockReturnValue(true);
     await flushQueuedReview();
@@ -299,7 +310,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.session_shutdown[0]({}, ctx);
   });
 
-  it('blocks user input while a review is running', async () => {
+  it('does not block input or tools after the queued review message is dispatched', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
@@ -314,58 +325,11 @@ describe('autoReviewExtension', () => {
     await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
-    const prompt = pi.sendUserMessage.mock.calls[0][0];
-    await pi.handlers.before_agent_start[0]({ prompt: `transformed\n${prompt}` }, ctx);
 
-    expect(await pi.handlers.input[0]({ source: 'interactive', text: 'interrupt review' }, ctx)).toEqual({ action: 'handled' });
-    expect(await pi.handlers.input[0]({ source: 'extension', text: 'extension interrupt' }, ctx)).toEqual({ action: 'handled' });
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is running. Please send your message after it completes.', 'warning');
-  });
-
-  it('blocks mutation tools before reviewer result but allows fixes after subagent review', async () => {
-    const pi = createFakePi(false);
-    const ctx = createFakeContext();
-    pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      return { stdout: '', stderr: '', code: 0 };
-    });
-
-    autoReviewExtension(pi as never);
-    await pi.handlers.session_start[0]({}, ctx);
-    await pi.handlers.agent_start[0]({}, ctx);
-    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
-    await pi.handlers.agent_end[0]({}, ctx);
-    await flushQueuedReview();
-    const prompt = pi.sendUserMessage.mock.calls[0][0];
-    await pi.handlers.before_agent_start[0]({ prompt: `transformed\n${prompt}` }, ctx);
-    await pi.handlers.agent_start[0]({}, ctx);
-
-    expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toEqual({
-      block: true,
-      reason: 'Auto review is read-only. Do not edit or write files during the review turn.',
-    });
-    expect(await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'git diff --no-ext-diff' } }, ctx)).toBeUndefined();
-    expect(await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'git commit -am fix' } }, ctx)).toEqual({
-      block: true,
-      reason: 'Auto review is read-only. Use only read-only inspection commands during the review turn.',
-    });
-    expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'worker' } }, ctx)).toEqual({
-      block: true,
-      reason: 'Auto review is waiting for the reviewer subagent. Do not call other subagents before the reviewer result returns.',
-    });
-    expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'reviewer' } }, ctx)).toBeUndefined();
-
-    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'worker' }, isError: false }, ctx);
-    expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toEqual({
-      block: true,
-      reason: 'Auto review is read-only. Do not edit or write files during the review turn.',
-    });
-
-    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
-
+    expect(await pi.handlers.input[0]({ source: 'interactive', text: 'interrupt review' }, ctx)).toBeUndefined();
     expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
-    expect(await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'npm test' } }, ctx)).toBeUndefined();
+    expect(await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'git commit -am fix' } }, ctx)).toBeUndefined();
+    expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'worker' } }, ctx)).toBeUndefined();
   });
 
   it('queues another review after the review turn applies bash fixes', async () => {
@@ -396,7 +360,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toContain('src/fix.ts');
+    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
   });
 
   it('does not queue another review for an identical already-queued fingerprint', async () => {
@@ -423,6 +387,37 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues another review when same-file diff content changes with unchanged status', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let diffCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+        diffCalls += 1;
+        return { stdout: diffCalls === 1 ? 'diff -- old content\n' : 'diff -- new content\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'echo fix > src/index.ts' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it('queues another review after unclassified bash changes files during the review fix phase', async () => {
@@ -453,7 +448,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toContain('generated.ts');
+    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
   });
 
   it('does not schedule another review after the review turn ends without fixes', async () => {
@@ -477,5 +472,378 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('loads config while keeping the dispatched prompt minimal', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerAgent: 'custom-reviewer' }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    expect(prompt).toBe('/skill:auto-review');
+
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'custom-reviewer' } }, ctx)).toBeUndefined();
+    expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'reviewer' } }, ctx)).toBeUndefined();
+  });
+
+  it('does not enforce mutation guard when autoFix is false', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
+
+    expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
+  });
+
+  it('does not block user input when blockInputDuringReview is false', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    ctx.isIdle.mockReturnValue(false);
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ blockInputDuringReview: false }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+
+    expect(await pi.handlers.input[0]({ source: 'interactive', text: 'next task' }, ctx)).toBeUndefined();
+  });
+
+  it('uses custom reviewStartWatchdogMs', async () => {
+    vi.useFakeTimers();
+    try {
+      const pi = createFakePi(false);
+      const dir = createTempDir();
+      const ctx = createFakeContext();
+      ctx.cwd = dir;
+      fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: 5000 }));
+      pi.exec.mockImplementation(async (command: string, args: string[]) => {
+        if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+        if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      });
+
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.handlers.agent_start[0]({}, ctx);
+      await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+      await pi.handlers.agent_end[0]({}, ctx);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(5000);
+      await pi.handlers.before_agent_start[0]({ prompt: 'normal user turn' }, ctx);
+
+      expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('runtime /auto-review off overrides config enabled', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: true }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('off', ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('no-auto-review flag overrides config enabled', async () => {
+    const pi = createFakePi(true);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: true }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('config init creates a project config file', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config init', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Created project config'), 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    expect(fs.existsSync(configPath)).toBe(true);
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.enabled).toBe(true);
+    expect(parsed.reviewerAgent).toBe('reviewer');
+  });
+
+  it('config init fails if config already exists', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: false }));
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config init', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('already exists'), 'error');
+  });
+
+  it('config set writes to project config and reloads', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set autoFix false', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Set autoFix = false'), 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.autoFix).toBe(false);
+  });
+
+  it('config set handles array values for reviewerSkills', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set reviewerSkills effect-ts-re reviewer', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Set reviewerSkills'), 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.reviewerSkills).toEqual(['effect-ts-re', 'reviewer']);
+  });
+
+  it('config set handles autoFixSuggestions boolean values', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set autoFixSuggestions true', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Set autoFixSuggestions = true', 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.autoFixSuggestions).toBe(true);
+  });
+
+  it('config set handles maxReviewPasses values', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set maxReviewPasses 2', ctx);
+    await pi.commands['auto-review'].handler('config set maxReviewPasses unlimited', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Set maxReviewPasses = 2', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Set maxReviewPasses = unlimited', 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.maxReviewPasses).toBeNull();
+  });
+
+  it('config set rejects invalid boolean value', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set autoFix maybe', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Expected boolean'), 'error');
+  });
+
+  it('config set rejects invalid number value', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set reviewStartWatchdogMs -1', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Expected positive number'), 'error');
+  });
+
+  it('config get shows merged value', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false }));
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config get autoFix', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('autoFix: false', 'info');
+  });
+
+  it('config show displays merged settings', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false }));
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config', ctx);
+
+    const lastCall = ctx.ui.notify.mock.calls[ctx.ui.notify.mock.calls.length - 1];
+    expect(lastCall[0]).toContain('Auto review configuration');
+    expect(lastCall[0]).toContain('autoFix: false');
+    expect(lastCall[0]).toContain('autoFixSuggestions: false');
+    expect(lastCall[0]).toContain('maxReviewPasses: unlimited');
+  });
+
+  it('status shows completed dispatched pass count', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.commands['auto-review'].handler('status', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle; completed passes: 1', 'info');
+  });
+
+  it('stops queueing after maxReviewPasses is reached', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ maxReviewPasses: 1 }));
+    let statusCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') {
+        statusCalls += 1;
+        return { stdout: statusCalls >= 4 ? ' M src/index.ts\n M src/fix.ts\n' : ' M src/index.ts\n', stderr: '', code: 0 };
+      }
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'echo fix > src/fix.ts' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review stopped after 1 pass(es); maxReviewPasses is 1.', 'info');
   });
 });

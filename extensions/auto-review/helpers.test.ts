@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { getMergedConfig } from './config.ts';
 import { AUTO_REVIEW_PROMPT_MARKER, AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 const tempDirs: string[] = [];
@@ -222,21 +223,121 @@ describe('shouldRunReview', () => {
 });
 
 describe('buildReviewPrompt', () => {
-  it('builds a subagent-backed review and fix prompt for worktree changes', () => {
-    const prompt = buildReviewPrompt({ changedFiles: ['src/index.ts'], status: ' M src/index.ts', beforeHead: 'abc', afterHead: 'abc' });
+  it('builds a minimal skill invocation prompt', () => {
+    const prompt = buildReviewPrompt({
+      changedFiles: ['src/index.ts'],
+      status: ' M src/index.ts',
+      beforeHead: 'abc',
+      afterHead: 'def',
+      reviewerAgent: 'custom-reviewer',
+      reviewerSkills: ['effect-ts-reviewer'],
+      reviewerTaskExtra: 'Check Effect service patterns.',
+      autoFix: false,
+      autoFixSuggestions: true,
+      reviewPass: 2,
+      maxReviewPasses: 3,
+    });
 
-    expect(prompt).toContain(AUTO_REVIEW_PROMPT_MARKER);
-    expect(prompt.startsWith(AUTO_REVIEW_SKILL_COMMAND)).toBe(true);
-    expect(prompt).toContain('Review and fix the code changes from the previous turn.');
-    expect(prompt).toContain('current chat context');
-    expect(prompt).toContain('src/index.ts');
-    expect(prompt).toContain('git diff --no-ext-diff');
-    expect(prompt).toContain('## Skills Used');
+    expect(prompt).toBe(AUTO_REVIEW_SKILL_COMMAND);
+    expect(prompt).not.toContain('src/index.ts');
+    expect(prompt).not.toContain('git diff --no-ext-diff');
+    expect(prompt).not.toContain('Reviewer agent:');
+    expect(prompt).not.toContain('Review pass:');
+  });
+});
+
+describe('getMergedConfig', () => {
+  it('applies defaults when no config files exist', () => {
+    const dir = createTempDir();
+    const config = getMergedConfig(dir, dir);
+    expect(config.enabled).toBe(true);
+    expect(config.reviewerAgent).toBe('reviewer');
+    expect(config.reviewerSkills).toEqual([]);
+    expect(config.reviewerTaskExtra).toBe('');
+    expect(config.autoFix).toBe(true);
+    expect(config.autoFixSuggestions).toBe(false);
+    expect(config.blockInputDuringReview).toBe(true);
+    expect(config.reviewStartWatchdogMs).toBe(30_000);
+    expect(config.maxReviewPasses).toBeNull();
   });
 
-  it('includes a committed range command when HEAD changed', () => {
-    const prompt = buildReviewPrompt({ changedFiles: ['src/index.ts'], status: '', beforeHead: 'abc', afterHead: 'def' });
+  it('lets project config override global config', () => {
+    const dir = createTempDir();
+    const project = path.join(dir, 'project');
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false, reviewerAgent: 'global-reviewer' }));
+    fs.writeFileSync(path.join(project, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: true, reviewerAgent: 'project-reviewer' }));
 
-    expect(prompt).toContain('git diff --no-ext-diff abc..def');
+    const config = getMergedConfig(project, dir);
+    expect(config.autoFix).toBe(true);
+    expect(config.reviewerAgent).toBe('project-reviewer');
+  });
+
+  it('ignores invalid JSON with fallback to defaults', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), 'not json');
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.enabled).toBe(true);
+  });
+
+  it('ignores unknown keys', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ unknownKey: 'value', enabled: false }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.enabled).toBe(false);
+    expect((config as unknown as Record<string, unknown>).unknownKey).toBeUndefined();
+  });
+
+  it('filters non-array reviewerSkills and non-string items', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerSkills: ['valid', 123, null] }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewerSkills).toEqual([]);
+  });
+
+  it('ignores non-finite reviewStartWatchdogMs', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: NaN }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewStartWatchdogMs).toBe(30_000);
+  });
+
+  it('ignores empty-string reviewerAgent and falls back to default', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerAgent: '' }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewerAgent).toBe('reviewer');
+  });
+
+  it('ignores non-positive reviewStartWatchdogMs and falls back to default', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: 0 }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewStartWatchdogMs).toBe(30_000);
+  });
+});
+
+describe('isReviewerSubagentInput with custom agent', () => {
+  it('detects custom reviewer agent', () => {
+    expect(isReviewerSubagentInput({ agent: 'custom-reviewer', task: 'review' }, 'custom-reviewer')).toBe(true);
+    expect(isReviewerSubagentInput({ agent: 'reviewer', task: 'review' }, 'custom-reviewer')).toBe(false);
+  });
+
+  it('defaults to reviewer when no agent arg given', () => {
+    expect(isReviewerSubagentInput({ agent: 'reviewer', task: 'review' })).toBe(true);
+    expect(isReviewerSubagentInput({ agent: 'custom-reviewer', task: 'review' })).toBe(false);
   });
 });

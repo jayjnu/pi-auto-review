@@ -51,19 +51,77 @@ At runtime:
 /auto-review off
 /auto-review on
 /auto-review status
+/auto-review config
+/auto-review config get <key>
+/auto-review config set <key> <value>
+/auto-review config init
 ```
 
 ## Runtime Control
 
-`/auto-review status` shows whether automatic review is enabled and whether a review is idle, queued, or running.
+`/auto-review status` shows whether automatic review is enabled, whether a review is idle/queued/running, and the current review pass count.
 
 `/auto-review off` disables review for the current Pi session.
 
 `/auto-review on` enables review for the current Pi session unless Pi was started with `--no-auto-review` and you want to keep it disabled.
 
+## Configuration
+
+`pi-auto-review` supports global and project-level config files.
+
+Global config path:
+
+```text
+~/.pi/agent/extensions/auto-review/config.json
+```
+
+Project config path:
+
+```text
+.pi/extensions/auto-review/config.json
+```
+
+Project config overrides global config. You can create and edit the project config through Pi commands:
+
+```text
+/auto-review config init
+/auto-review config
+/auto-review config set autoFix false
+/auto-review config set autoFixSuggestions false
+/auto-review config set maxReviewPasses 2
+/auto-review config set maxReviewPasses unlimited
+```
+
+Example config file:
+
+```json
+{
+  "reviewerAgent": "reviewer",
+  "reviewerSkills": ["effect-ts-reviewer"],
+  "reviewerTaskExtra": "Check Effect service/layer patterns.",
+  "autoFix": true,
+  "autoFixSuggestions": false,
+  "blockInputDuringReview": true,
+  "reviewStartWatchdogMs": 30000,
+  "maxReviewPasses": null
+}
+```
+
+- `enabled` — enable or disable automatic review (default: `true`).
+- `reviewerAgent` — the subagent name used for review (default: `reviewer`).
+- `reviewerSkills` — additional skills to inject into the reviewer subagent (default: `[]`).
+- `reviewerTaskExtra` — extra instructions appended to the reviewer task (default: `""`).
+- `autoFix` — allow the main agent to apply Critical/Warning fixes after the reviewer returns (default: `true`).
+- `autoFixSuggestions` — allow automatic fixing of Suggestions when safe and local (default: `false`). By default, Suggestions are report-only.
+- `blockInputDuringReview` — block new user messages while a review is queued or running (default: `true`).
+- `reviewStartWatchdogMs` — timeout in ms before a stuck queued review is dropped (default: `30000`).
+- `maxReviewPasses` — optional review/fix pass limit for one review loop. Use `null`/`none`/`unlimited` for no limit (default: `null`).
+
+Priority: `--no-auto-review` flag > runtime `/auto-review on/off` > project config > global config > defaults.
+
 ## Customizing Reviews
 
-Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, package skills, and `pi-subagents` reviewer configuration. The bundled `auto-review` skill prompts the main agent to call the bundled `reviewer` subagent and then fix Critical/Warning findings.
+Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, package skills, and `pi-subagents` reviewer configuration. The bundled `auto-review` skill prompts the main agent to call the configured reviewer subagent and then fix Critical/Warning findings.
 
 ## Safety
 
