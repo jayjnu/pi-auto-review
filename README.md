@@ -1,6 +1,6 @@
 # pi-auto-review
 
-A Pi package that automatically runs a read-only code review after a Pi agent finishes a user prompt that changed code.
+A Pi package that automatically queues a subagent-backed code review and fix loop after a Pi agent finishes a user prompt that changed code.
 
 ## Install
 
@@ -22,18 +22,20 @@ pi -e /path/to/pi-auto-review
 
 ## Behavior
 
-`pi-auto-review` runs once after an agent prompt changes code. It does not run after every individual edit. If the agent commits its changes and leaves a clean worktree, auto-review reviews the committed range from the turn's starting `HEAD` to the ending `HEAD`.
+`pi-auto-review` runs once after an agent prompt changes code. It does not run after every individual edit. If the agent commits its changes and leaves a clean worktree, auto-review asks the main agent to review the committed range from the turn's starting `HEAD` to the ending `HEAD`.
 
-The reviewer is a separate Pi subprocess. The subprocess uses normal Pi settings and discovery:
+The package bundles `pi-subagents` and an `auto-review` skill. After Pi becomes idle, it queues a short `/skill:auto-review` main-agent orchestration turn. That skill tells the main agent to first call the `reviewer` subagent, then apply fixes in the main session when the reviewer reports Critical or Warning findings. That means:
 
-- `~/.pi/agent/settings.json`
-- `.pi/settings.json`
-- `AGENTS.md`
-- Pi skills from global, user, project, and package locations
+- review context is isolated in a child Pi session via `pi-subagents`;
+- fixes happen in the visible main chat flow;
+- the extension briefly blocks new user input while review/fix is queued or running;
+- no custom background reviewer process is spawned by `pi-auto-review`.
+
+Before the reviewer subagent returns, the extension blocks `edit` and `write` tool calls and allows only read-only bash inspection commands as an extra guard. After the reviewer result returns, the main agent may apply fixes. If those fixes change files, `pi-auto-review` queues another review turn.
+
+The package assumes Pi skill commands are enabled. Pi defaults `enableSkillCommands` to `true`; if your effective settings disable it, `pi-auto-review` shows a session-start warning asking you to set `"enableSkillCommands": true` in `~/.pi/agent/settings.json` or `.pi/settings.json`.
 
 The package does not define a custom model setting. Configure reviewer model behavior with Pi's official `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` settings.
-
-When the isolated reviewer reports Critical or Warning findings, auto-fix can queue a follow-up main-agent turn to apply concrete fixes. Suggestion-only reviews do not trigger auto-fix automatically.
 
 ## Disable
 
@@ -43,39 +45,26 @@ Start Pi with:
 pi --no-auto-review
 ```
 
-Disable automatic follow-up fixes while keeping review enabled:
-
-```bash
-pi --no-auto-review-fix
-```
-
 At runtime:
 
 ```text
 /auto-review off
 /auto-review on
 /auto-review status
-/auto-review fix off
-/auto-review fix on
-/auto-review fix status
 ```
 
 ## Runtime Control
 
-`/auto-review status` shows whether automatic review and auto-fix are currently enabled.
+`/auto-review status` shows whether automatic review is enabled and whether a review is idle, queued, or running.
 
 `/auto-review off` disables review for the current Pi session.
 
 `/auto-review on` enables review for the current Pi session unless Pi was started with `--no-auto-review` and you want to keep it disabled.
 
-`/auto-review fix off` disables automatic follow-up fix turns for the current Pi session.
-
-`/auto-review fix on` enables automatic follow-up fix turns for Critical and Warning findings.
-
 ## Customizing Reviews
 
-Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, and package skills. The spawned reviewer is prompted to inspect and follow relevant skills and loaded context.
+Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, package skills, and `pi-subagents` reviewer configuration. The bundled `auto-review` skill prompts the main agent to call the bundled `reviewer` subagent and then fix Critical/Warning findings.
 
 ## Safety
 
-The reviewer subprocess receives only `read`, `grep`, `find`, `ls`, and `bash`. Its prompt instructs it to use bash for read-only commands only.
+Before the reviewer subagent returns, the queued `/skill:auto-review` turn instructs the main agent not to modify files. The extension also blocks `edit` and `write` tool calls, and limits bash to read-only inspection commands. After the reviewer returns, the main agent can apply fixes for Critical/Warning findings.

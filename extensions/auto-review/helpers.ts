@@ -1,7 +1,10 @@
-import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 export interface ReviewDecisionInput {
   enabled: boolean;
+  reviewQueued: boolean;
   reviewInProgress: boolean;
   sawMutationTool: boolean;
   beforeStatus: string;
@@ -10,30 +13,206 @@ export interface ReviewDecisionInput {
   afterHead?: string;
 }
 
-export interface ReviewTaskInput {
+export interface ReviewPromptInput {
   changedFiles: string[];
   status: string;
-  reviewTarget?: string;
-  suggestedCommands?: string[];
+  beforeHead?: string;
+  afterHead?: string;
 }
 
-export interface AutoFixTaskInput {
-  reviewText: string;
-  changedFiles: string[];
-  fingerprint: string;
+export const AUTO_REVIEW_PROMPT_MARKER = '<!-- pi-auto-review-turn -->';
+export const AUTO_REVIEW_SKILL_COMMAND = '/skill:auto-review';
+
+const READ_ONLY_REVIEW_COMMANDS = new Set(['pwd', 'ls', 'grep', 'rg', 'cat', 'head', 'tail', 'wc']);
+
+function readEnableSkillCommandsSetting(filePath: string): boolean | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as unknown;
+    if (!parsed || typeof parsed !== 'object') return undefined;
+    const value = (parsed as { enableSkillCommands?: unknown }).enableSkillCommands;
+    return typeof value === 'boolean' ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-export interface ReviewFingerprintInput {
-  status: string;
-  diff: string;
-  cachedDiff: string;
-  committedDiff?: string;
-  untrackedSnapshot?: string;
+export function areSkillCommandsEnabled(cwd: string, homeDir = os.homedir()): boolean {
+  let enabled = true;
+  const globalSetting = readEnableSkillCommandsSetting(path.join(homeDir, '.pi', 'agent', 'settings.json'));
+  if (typeof globalSetting === 'boolean') enabled = globalSetting;
+  const projectSetting = readEnableSkillCommandsSetting(path.join(cwd, '.pi', 'settings.json'));
+  if (typeof projectSetting === 'boolean') enabled = projectSetting;
+  return enabled;
 }
 
 export function isFileMutationToolResult(toolName: string, isError: boolean | undefined): boolean {
   if (isError) return false;
   return toolName === 'edit' || toolName === 'write';
+}
+
+function isReviewerTask(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const task = value as { agent?: unknown; tasks?: unknown };
+  if (task.agent === 'reviewer') return true;
+  if (Array.isArray(task.tasks)) return task.tasks.length > 0 && task.tasks.every(isReviewerTask);
+  return false;
+}
+
+export function isReviewerSubagentInput(input: Record<string, unknown> | undefined): boolean {
+  if (!input) return false;
+  if (input.agent === 'reviewer') return true;
+  if (Array.isArray(input.tasks)) return input.tasks.length > 0 && input.tasks.every(isReviewerTask);
+  return false;
+}
+
+export function isLikelyMutatingBashCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+  if (hasShellMetaOutsideQuotes(trimmed, (char, quote) => quote === undefined && /[><;&|]/.test(char))) return true;
+
+  const [binary = ''] = trimmed.split(/\s+/, 1);
+  if (['rm', 'mv', 'cp', 'touch', 'mkdir', 'rmdir', 'ln', 'chmod', 'chown', 'tee'].includes(binary)) return true;
+  if (binary === 'sed' && /(?:^|\s)(?:--in-place(?:=\S*)?|-i(?:\S*|\s|$))/.test(trimmed)) return true;
+  if (binary === 'find' && /(?:^|\s)-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls|chmod|chown)\b/.test(trimmed)) return true;
+  if (binary === 'git') {
+    if (/^git\s+(?:branch|tag)\b/.test(trimmed)) return !isReadOnlyReviewBashCommand(trimmed);
+    return /^git\s+(?:add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|rebase|reset|restore|rm|stash|switch)\b/.test(trimmed);
+  }
+  if (['npm', 'pnpm', 'yarn', 'bun'].includes(binary)) {
+    const subcommand = trimmed.slice(binary.length).trim().split(/\s+/, 1)[0] ?? '';
+    return ['add', 'install', 'i', 'remove', 'rm', 'update', 'upgrade', 'dedupe', 'prune'].includes(subcommand);
+  }
+  return false;
+}
+
+function hasShellMetaOutsideQuotes(command: string, isUnsafe: (char: string, quote: 'single' | 'double' | undefined) => boolean): boolean {
+  let quote: 'single' | 'double' | undefined;
+  let escaped = false;
+
+  for (const char of command) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === "'" && quote !== 'double') {
+      quote = quote === 'single' ? undefined : 'single';
+      continue;
+    }
+    if (char === '"' && quote !== 'single') {
+      quote = quote === 'double' ? undefined : 'double';
+      continue;
+    }
+    if (isUnsafe(char, quote)) return true;
+  }
+
+  return quote !== undefined;
+}
+
+function hasUnsafeShellMetaOutsideQuotes(command: string): boolean {
+  return hasShellMetaOutsideQuotes(command, (char, quote) => {
+    if (char === '`') return true;
+    if (char === '$' && quote !== 'single') return true;
+    if (quote !== undefined) return false;
+    return /[;&|><\n\r]/.test(char);
+  });
+}
+
+function isReadOnlyGitBranch(rest: string): boolean {
+  if (rest === '') return true;
+  if (/(?:^|\s)(?:-(?:d|D|m|M|c|C)|--(?:delete|move|copy|force))\b/.test(rest)) return false;
+
+  const tokens = rest.split(/\s+/).filter(Boolean);
+  let allowsPatternArgs = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? '';
+    if (/^-[rav]+$/.test(token)) {
+      allowsPatternArgs = true;
+      continue;
+    }
+    if (['--list', '--all', '--remotes', '--verbose'].includes(token)) {
+      allowsPatternArgs = true;
+      continue;
+    }
+    if (['--show-current', '--color', '--no-color', '--column', '--no-column'].includes(token)) continue;
+    if (['--contains', '--merged', '--no-merged', '--points-at', '--format', '--sort'].includes(token)) {
+      const next = tokens[index + 1];
+      if (next && !next.startsWith('-')) index += 1;
+      continue;
+    }
+    if (/^--(?:contains|points-at|format|sort)=\S+$/.test(token)) continue;
+    if (allowsPatternArgs && !token.startsWith('-')) continue;
+    return false;
+  }
+  return true;
+}
+
+function isReadOnlyGitTag(rest: string): boolean {
+  if (rest === '') return true;
+  if (/(?:^|\s)(?:-(?:a|d|f|m|s|u)|--(?:annotate|delete|force|local-user|message|sign))\b/.test(rest)) return false;
+
+  const tokens = rest.split(/\s+/).filter(Boolean);
+  let allowsPatternArgs = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? '';
+    if (/^-n\d*$/.test(token)) continue;
+    if (token === '-l' || token === '--list') {
+      allowsPatternArgs = true;
+      continue;
+    }
+    if (token === '-v' || token === '--verify') {
+      const next = tokens[index + 1];
+      if (!next || next.startsWith('-')) return false;
+      index += 1;
+      continue;
+    }
+    if (['--column', '--no-column'].includes(token)) continue;
+    if (['--contains', '--merged', '--no-merged', '--points-at', '--format', '--sort'].includes(token)) {
+      const next = tokens[index + 1];
+      if (next && !next.startsWith('-')) index += 1;
+      continue;
+    }
+    if (/^--(?:contains|points-at|format|sort)=\S+$/.test(token)) continue;
+    if (allowsPatternArgs && !token.startsWith('-')) continue;
+    return false;
+  }
+  return true;
+}
+
+export function isReadOnlyReviewBashCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) return false;
+
+  // Review turns should only inspect state. Block shell composition and
+  // redirection so an otherwise read-only command cannot be chained into a
+  // mutation such as `git diff > file` or `grep x | xargs rm`. Quoted regex
+  // metacharacters like `rg 'foo|bar'` are allowed.
+  if (hasUnsafeShellMetaOutsideQuotes(trimmed)) return false;
+
+  const [binary = ''] = trimmed.split(/\s+/, 1);
+  if (binary === 'git') {
+    if (/\s--output(?:=|\s)/.test(trimmed)) return false;
+    if (/\s--(?:ext-diff|external-diff)\b/.test(trimmed)) return false;
+    if (/^git\s+branch\b/.test(trimmed)) {
+      const rest = trimmed.replace(/^git\s+branch\b/, '').trim();
+      return isReadOnlyGitBranch(rest);
+    }
+    if (/^git\s+tag\b/.test(trimmed)) {
+      const rest = trimmed.replace(/^git\s+tag\b/, '').trim();
+      return isReadOnlyGitTag(rest);
+    }
+    return /^git\s+(?:blame|diff|ls-files|log|rev-parse|show|status)\b/.test(trimmed);
+  }
+
+  if (binary === 'find') {
+    if (/(?:^|\s)-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls|chmod|chown)\b/.test(trimmed)) return false;
+    return true;
+  }
+
+  return READ_ONLY_REVIEW_COMMANDS.has(binary);
 }
 
 export function parseChangedFiles(status: string): string[] {
@@ -51,6 +230,7 @@ export function parseChangedFiles(status: string): string[] {
 
 export function shouldRunReview(input: ReviewDecisionInput): boolean {
   if (!input.enabled) return false;
+  if (input.reviewQueued) return false;
   if (input.reviewInProgress) return false;
 
   const statusChanged = input.beforeStatus.trim() !== input.afterStatus.trim();
@@ -61,107 +241,24 @@ export function shouldRunReview(input: ReviewDecisionInput): boolean {
   return statusChanged || headChanged;
 }
 
-export function buildReviewFingerprint(input: ReviewFingerprintInput): string {
-  return createHash('sha256')
-    .update('pi-auto-review:v1\0')
-    .update(input.status)
-    .update('\0diff\0')
-    .update(input.diff)
-    .update('\0cached\0')
-    .update(input.cachedDiff)
-    .update('\0committed\0')
-    .update(input.committedDiff ?? '')
-    .update('\0untracked\0')
-    .update(input.untrackedSnapshot ?? '')
-    .digest('hex');
-}
-
-function getMarkdownSection(text: string, heading: string): string {
-  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const headingPattern = new RegExp(`^##\\s+${escapedHeading}\\b`, 'i');
-  const lines = text.split('\n');
-  const start = lines.findIndex((line) => headingPattern.test(line));
-  if (start === -1) return '';
-
-  const relativeEnd = lines.slice(start + 1).findIndex((line) => /^##\s+/.test(line));
-  const end = relativeEnd === -1 ? lines.length : start + 1 + relativeEnd;
-  return lines.slice(start + 1, end).join('\n').trim();
-}
-
-function isNonActionableLine(line: string): boolean {
-  const normalized = line.replace(/^[-*]\s*/, '').trim();
-  if (!normalized) return true;
-  if (/^(none|nothing|n\/?a|not\s+applicable|없음)(?:\b|[\s.!—-]|$)/i.test(normalized)) return true;
-  if (/^no\s+concerns?(?:\b|[\s.!—-]|$)/i.test(normalized)) return true;
-  return /^no\b/i.test(normalized) && /\b(issues?|warnings?|suggestions?|critical|actionable|findings?|problems?|blockers?|concerns?)\b/i.test(normalized);
-}
-
-function sectionHasContent(section: string): boolean {
-  const lines = section
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  return lines.some((line) => !isNonActionableLine(line));
-}
-
-export function hasBlockingReviewFindings(text: string): boolean {
-  return ['Critical', 'Warnings'].some((heading) => sectionHasContent(getMarkdownSection(text, heading)));
-}
-
-export function ensureSkillsUsedSection(text: string): string {
-  if (/^##\s+Skills Used\b/im.test(text)) return text;
-  return ['## Skills Used', '- Not reported by reviewer.', '', text].join('\n');
-}
-
-function markdownFenceFor(text: string): string {
-  const longestRun = Math.max(2, ...Array.from(text.matchAll(/`+/g), (match) => match[0].length));
-  return '`'.repeat(longestRun + 1);
-}
-
-export function buildAutoFixTask(input: AutoFixTaskInput): string {
-  const changedFiles = input.changedFiles.length > 0 ? input.changedFiles.map((file) => `- ${file}`).join('\n') : '- (no changed files parsed)';
-  const reviewFence = markdownFenceFor(input.reviewText);
-
-  return [
-    'Auto review found Critical or Warning findings in the current diff. Fix them now.',
-    '',
-    'Rules:',
-    '- Apply concrete code changes for Critical and Warnings findings.',
-    '- Apply Suggestions only when they are safe, local, and aligned with the user request.',
-    '- Do not run another review yourself; the auto-review extension will re-check after your changes.',
-    '- If a finding is intentionally not fixable, explain why briefly.',
-    '',
-    `Review fingerprint: ${input.fingerprint}`,
-    '',
-    'Changed files:',
-    changedFiles,
-    '',
-    'Reviewer output:',
-    `${reviewFence}markdown`,
-    input.reviewText,
-    reviewFence,
-  ].join('\n');
-}
-
-export function buildReviewTask(input: ReviewTaskInput): string {
+export function buildReviewPrompt(input: ReviewPromptInput): string {
   const changedFiles = input.changedFiles.length > 0 ? input.changedFiles.map((file) => `- ${file}`).join('\n') : '- (no changed files parsed)';
   const status = input.status.trim().length > 0 ? input.status.trim() : '(empty git status)';
-  const reviewTarget = input.reviewTarget ?? 'Review the current git diff after the parent Pi agent changed code.';
-  const suggestedCommands = input.suggestedCommands?.length
-    ? input.suggestedCommands.map((command) => `- \`${command}\``).join('\n')
-    : '- `git diff --no-ext-diff`\n- `git diff --cached --no-ext-diff`';
+  const beforeHead = input.beforeHead?.trim() || '(unknown)';
+  const afterHead = input.afterHead?.trim() || '(unknown)';
+  const headChanged = beforeHead !== '(unknown)' && afterHead !== '(unknown)' && beforeHead !== afterHead;
+  const suggestedCommands = headChanged
+    ? [`git diff --no-ext-diff ${beforeHead}..${afterHead}`, 'git diff --no-ext-diff', 'git diff --cached --no-ext-diff']
+    : ['git diff --no-ext-diff', 'git diff --cached --no-ext-diff'];
 
   return [
-    reviewTarget,
+    AUTO_REVIEW_SKILL_COMMAND,
     '',
-    'Before reviewing:',
-    '1. Inspect the available skills listed in your system prompt.',
-    '2. If any relevant skills exist for code review, changed file types, testing, security, architecture, or project conventions, read and follow them.',
-    '3. Make skill usage visible to the user in the final review. List every skill you read or followed by name when possible, plus a short reason.',
-    '4. If no skill was relevant or loaded, explicitly say so.',
-    '5. Follow all loaded AGENTS.md and project instructions.',
-    '6. Use bash for read-only commands only, such as git diff, git status, git log, and git show.',
+    AUTO_REVIEW_PROMPT_MARKER,
+    'Review and fix the code changes from the previous turn.',
+    '',
+    'Use the current chat context and project instructions while orchestrating review/fix.',
+    'Before the reviewer result returns, use read-only inspection tools/commands only.',
     '',
     'Changed files:',
     changedFiles,
@@ -171,10 +268,14 @@ export function buildReviewTask(input: ReviewTaskInput): string {
     status,
     '```',
     '',
-    'Suggested inspection commands:',
-    suggestedCommands,
+    'HEAD range:',
+    `- before: ${beforeHead}`,
+    `- after: ${afterHead}`,
     '',
-    'Use git diff/git show and file reads to review the changes. Report concrete findings with file paths and line numbers.',
+    'Suggested inspection commands:',
+    ...suggestedCommands.map((command) => `- \`${command}\``),
+    '',
+    'Report concrete findings with file paths and line numbers.',
     '',
     'Output format:',
     '## Skills Used',
@@ -184,42 +285,4 @@ export function buildReviewTask(input: ReviewTaskInput): string {
     '## Suggestions',
     '## Files Reviewed',
   ].join('\n');
-}
-
-export function buildChildPiArgs(metaPromptPath: string, task: string): string[] {
-  return [
-    '--mode',
-    'json',
-    '-p',
-    '--no-session',
-    '--tools',
-    'read,grep,find,ls,bash',
-    '--append-system-prompt',
-    metaPromptPath,
-    task,
-  ];
-}
-
-export function extractFinalAssistantText(jsonOutput: string): string {
-  let finalText = '';
-
-  for (const line of jsonOutput.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line) as {
-        type?: string;
-        message?: {
-          role?: string;
-          content?: Array<{ type?: string; text?: string }>;
-        };
-      };
-      if (event.type !== 'message_end' || event.message?.role !== 'assistant') continue;
-      const text = event.message.content?.find((part) => part.type === 'text')?.text;
-      if (text) finalText = text;
-    } catch {
-      continue;
-    }
-  }
-
-  return finalText || '(review completed with no assistant output)';
 }

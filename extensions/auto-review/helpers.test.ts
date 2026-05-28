@@ -1,16 +1,46 @@
-import { describe, expect, it } from 'vitest';
-import {
-  buildAutoFixTask,
-  buildChildPiArgs,
-  buildReviewFingerprint,
-  buildReviewTask,
-  ensureSkillsUsedSection,
-  extractFinalAssistantText,
-  hasBlockingReviewFindings,
-  isFileMutationToolResult,
-  parseChangedFiles,
-  shouldRunReview,
-} from './helpers.ts';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { AUTO_REVIEW_PROMPT_MARKER, AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
+
+const tempDirs: string[] = [];
+
+function createTempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-auto-review-settings-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe('areSkillCommandsEnabled', () => {
+  it('defaults to enabled when no settings files exist', () => {
+    const dir = createTempDir();
+    expect(areSkillCommandsEnabled(path.join(dir, 'project'), dir)).toBe(true);
+  });
+
+  it('lets project settings override global settings', () => {
+    const dir = createTempDir();
+    const project = path.join(dir, 'project');
+    fs.mkdirSync(path.join(dir, '.pi', 'agent'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.pi'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'settings.json'), JSON.stringify({ enableSkillCommands: false }));
+    fs.writeFileSync(path.join(project, '.pi', 'settings.json'), JSON.stringify({ enableSkillCommands: true }));
+
+    expect(areSkillCommandsEnabled(project, dir)).toBe(true);
+  });
+
+  it('returns false when effective settings disable skill commands', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'settings.json'), JSON.stringify({ enableSkillCommands: false }));
+
+    expect(areSkillCommandsEnabled(path.join(dir, 'project'), dir)).toBe(false);
+  });
+});
 
 describe('isFileMutationToolResult', () => {
   it('detects successful edit and write tool results', () => {
@@ -22,6 +52,115 @@ describe('isFileMutationToolResult', () => {
     expect(isFileMutationToolResult('edit', true)).toBe(false);
     expect(isFileMutationToolResult('bash', false)).toBe(false);
     expect(isFileMutationToolResult('read', false)).toBe(false);
+  });
+});
+
+describe('isReviewerSubagentInput', () => {
+  it('detects reviewer subagent inputs', () => {
+    expect(isReviewerSubagentInput({ agent: 'reviewer', task: 'review diff' })).toBe(true);
+    expect(isReviewerSubagentInput({ tasks: [{ agent: 'reviewer', task: 'a' }, { agent: 'reviewer', task: 'b' }] })).toBe(true);
+  });
+
+  it('rejects non-reviewer or mixed subagent inputs', () => {
+    expect(isReviewerSubagentInput({ agent: 'worker', task: 'fix' })).toBe(false);
+    expect(isReviewerSubagentInput({ tasks: [{ agent: 'reviewer', task: 'a' }, { agent: 'worker', task: 'b' }] })).toBe(false);
+    expect(isReviewerSubagentInput({ tasks: [] })).toBe(false);
+    expect(isReviewerSubagentInput(undefined)).toBe(false);
+  });
+});
+
+describe('isLikelyMutatingBashCommand', () => {
+  it('detects common bash mutation commands', () => {
+    expect(isLikelyMutatingBashCommand('echo fix > src/index.ts')).toBe(true);
+    expect(isLikelyMutatingBashCommand('rm -rf dist')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git commit -am fix')).toBe(true);
+    expect(isLikelyMutatingBashCommand('echo ok && git commit -am fix')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git branch new-feature')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git tag v1.0.0')).toBe(true);
+    expect(isLikelyMutatingBashCommand('npm install left-pad')).toBe(true);
+    expect(isLikelyMutatingBashCommand('sed -i s/a/b/ file.ts')).toBe(true);
+    expect(isLikelyMutatingBashCommand("sed -i'' s/a/b/ file.ts")).toBe(true);
+    expect(isLikelyMutatingBashCommand('sed --in-place s/a/b/ file.ts')).toBe(true);
+    expect(isLikelyMutatingBashCommand('find . -delete')).toBe(true);
+    expect(isLikelyMutatingBashCommand('find . -chown root')).toBe(true);
+  });
+
+  it('does not flag common read-only inspection commands', () => {
+    expect(isLikelyMutatingBashCommand('git diff --no-ext-diff')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --show-current')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch -a -v')).toBe(false);
+    expect(isLikelyMutatingBashCommand("git branch -a 'feature/*'")).toBe(false);
+    expect(isLikelyMutatingBashCommand("git branch --list 'feature/*'")).toBe(false);
+    expect(isLikelyMutatingBashCommand('git tag --list')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git tag -n -l')).toBe(false);
+    expect(isLikelyMutatingBashCommand("git tag -l 'v1.*'")).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --merged main')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --no-merged main')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --all')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --remotes')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git branch --verbose')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git tag --merged main')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git tag --no-merged main')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git tag --verify v1.0.0')).toBe(false);
+    expect(isLikelyMutatingBashCommand('npm test')).toBe(false);
+    expect(isLikelyMutatingBashCommand('rg TODO src')).toBe(false);
+    expect(isLikelyMutatingBashCommand("rg 'foo>bar' src")).toBe(false);
+    expect(isLikelyMutatingBashCommand('grep "a<b" file')).toBe(false);
+  });
+});
+
+describe('isReadOnlyReviewBashCommand', () => {
+  it('allows simple read-only inspection commands used during review', () => {
+    expect(isReadOnlyReviewBashCommand('git diff --no-ext-diff')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git status --porcelain')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git ls-files')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --show-current')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch -a -v')).toBe(true);
+    expect(isReadOnlyReviewBashCommand("git branch -a 'feature/*'")).toBe(true);
+    expect(isReadOnlyReviewBashCommand("git branch --list 'feature/*'")).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag --list')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag -n -l')).toBe(true);
+    expect(isReadOnlyReviewBashCommand("git tag -l 'v1.*'")).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag -v v1.0.0')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --merged main')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --no-merged main')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --all')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --remotes')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git branch --verbose')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag --merged main')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag --no-merged main')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git tag --verify v1.0.0')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('rg "TODO" extensions')).toBe(true);
+    expect(isReadOnlyReviewBashCommand("rg 'foo|bar' src")).toBe(true);
+    expect(isReadOnlyReviewBashCommand("grep 'a$b' file")).toBe(true);
+    expect(isReadOnlyReviewBashCommand('find extensions -type f')).toBe(true);
+  });
+
+  it('blocks mutation-capable bash commands during review', () => {
+    expect(isReadOnlyReviewBashCommand('git commit -am fix')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git diff --ext-diff')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git diff --external-diff')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git branch -D old-branch')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git branch --delete old-branch')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git branch --move old new')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git tag -d v1.0.0')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git tag --delete v1.0.0')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git tag --force v1.0.0')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git branch new-feature')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git tag v1.0.0')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git branch --no-color new-feature')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git tag --no-column v1.0.0')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('rm -rf dist')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('sed -n "1,20p" README.md')).toBe(false);
+    expect(isReadOnlyReviewBashCommand("sed -n '1w out.txt' README.md")).toBe(false);
+    expect(isReadOnlyReviewBashCommand('find . -delete')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('find . -chmod 777')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('find . -fprint files.txt')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('find . -fprint0 files.txt')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git diff > review.patch')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('grep foo README.md | xargs rm')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('grep "a$b" file')).toBe(false);
+    expect(isReadOnlyReviewBashCommand("grep 'unterminated file")).toBe(false);
   });
 });
 
@@ -41,6 +180,7 @@ describe('shouldRunReview', () => {
     expect(
       shouldRunReview({
         enabled: true,
+        reviewQueued: false,
         reviewInProgress: false,
         sawMutationTool: true,
         beforeStatus: '',
@@ -53,6 +193,7 @@ describe('shouldRunReview', () => {
     expect(
       shouldRunReview({
         enabled: true,
+        reviewQueued: false,
         reviewInProgress: false,
         sawMutationTool: true,
         beforeStatus: '',
@@ -63,153 +204,39 @@ describe('shouldRunReview', () => {
     ).toBe(true);
   });
 
-  it('runs when git status changed even without edit/write tool detection', () => {
-    expect(
-      shouldRunReview({
-        enabled: true,
-        reviewInProgress: false,
-        sawMutationTool: false,
-        beforeStatus: '',
-        afterStatus: ' M src/index.ts',
-      }),
-    ).toBe(true);
-  });
+  it('does not run when disabled, already queued, reviewing, or unchanged', () => {
+    const base = {
+      enabled: true,
+      reviewQueued: false,
+      reviewInProgress: false,
+      sawMutationTool: true,
+      beforeStatus: '',
+      afterStatus: ' M a.ts',
+    };
 
-  it('does not run when disabled, already running, or unchanged', () => {
-    expect(
-      shouldRunReview({
-        enabled: false,
-        reviewInProgress: false,
-        sawMutationTool: true,
-        beforeStatus: '',
-        afterStatus: ' M a.ts',
-      }),
-    ).toBe(false);
-    expect(
-      shouldRunReview({
-        enabled: true,
-        reviewInProgress: true,
-        sawMutationTool: true,
-        beforeStatus: '',
-        afterStatus: ' M a.ts',
-      }),
-    ).toBe(false);
-    expect(
-      shouldRunReview({
-        enabled: true,
-        reviewInProgress: false,
-        sawMutationTool: false,
-        beforeStatus: '',
-        afterStatus: '',
-      }),
-    ).toBe(false);
+    expect(shouldRunReview({ ...base, enabled: false })).toBe(false);
+    expect(shouldRunReview({ ...base, reviewQueued: true })).toBe(false);
+    expect(shouldRunReview({ ...base, reviewInProgress: true })).toBe(false);
+    expect(shouldRunReview({ ...base, sawMutationTool: false, afterStatus: '' })).toBe(false);
   });
 });
 
-describe('buildReviewFingerprint', () => {
-  it('is stable for the same status and diffs and changes when the diff changes', () => {
-    const first = buildReviewFingerprint({ status: ' M a.ts', diff: 'diff-a', cachedDiff: '' });
-    const second = buildReviewFingerprint({ status: ' M a.ts', diff: 'diff-a', cachedDiff: '' });
-    const changed = buildReviewFingerprint({ status: ' M a.ts', diff: 'diff-b', cachedDiff: '' });
+describe('buildReviewPrompt', () => {
+  it('builds a subagent-backed review and fix prompt for worktree changes', () => {
+    const prompt = buildReviewPrompt({ changedFiles: ['src/index.ts'], status: ' M src/index.ts', beforeHead: 'abc', afterHead: 'abc' });
 
-    expect(first).toBe(second);
-    expect(first).not.toBe(changed);
-  });
-});
-
-describe('hasBlockingReviewFindings', () => {
-  it('detects only Critical and Warnings as auto-fix blocking findings', () => {
-    expect(hasBlockingReviewFindings('## Critical\n- Fix this')).toBe(true);
-    expect(hasBlockingReviewFindings('## Warnings\n- Fix this')).toBe(true);
-    expect(hasBlockingReviewFindings('## Suggestions\n- Optional nit')).toBe(false);
+    expect(prompt).toContain(AUTO_REVIEW_PROMPT_MARKER);
+    expect(prompt.startsWith(AUTO_REVIEW_SKILL_COMMAND)).toBe(true);
+    expect(prompt).toContain('Review and fix the code changes from the previous turn.');
+    expect(prompt).toContain('current chat context');
+    expect(prompt).toContain('src/index.ts');
+    expect(prompt).toContain('git diff --no-ext-diff');
+    expect(prompt).toContain('## Skills Used');
   });
 
-  it('ignores common clean-review wording in Critical and Warnings sections', () => {
-    expect(hasBlockingReviewFindings('## Critical\nNone.\n\n## Warnings\n- None')).toBe(false);
-    expect(hasBlockingReviewFindings('## Warnings\nNo warnings found in this diff.')).toBe(false);
-    expect(hasBlockingReviewFindings('## Critical\nNo critical findings.\n\n## Warnings\nNo actionable findings found.')).toBe(false);
-    expect(hasBlockingReviewFindings('## Warnings\nNone — only suggestions.')).toBe(false);
-    expect(hasBlockingReviewFindings('## Critical\nNothing to report.\n\n## Warnings\nNo concerns.')).toBe(false);
-    expect(hasBlockingReviewFindings('## Warnings\nNot applicable.')).toBe(false);
-  });
-});
+  it('includes a committed range command when HEAD changed', () => {
+    const prompt = buildReviewPrompt({ changedFiles: ['src/index.ts'], status: '', beforeHead: 'abc', afterHead: 'def' });
 
-describe('ensureSkillsUsedSection', () => {
-  it('preserves reviews that already include a skills section', () => {
-    const text = '## Skills Used\n- effect-typescript\n\n## Summary';
-    expect(ensureSkillsUsedSection(text)).toBe(text);
-  });
-
-  it('prepends a fallback skills section when missing', () => {
-    expect(ensureSkillsUsedSection('## Summary\nNo issues')).toContain('## Skills Used\n- Not reported by reviewer.');
-  });
-});
-
-describe('buildAutoFixTask', () => {
-  it('builds a main-agent follow-up task with reviewer output', () => {
-    const task = buildAutoFixTask({ reviewText: '## Critical\n- Fix `src/index.ts:1`', changedFiles: ['src/index.ts'], fingerprint: 'abc123' });
-
-    expect(task).toContain('Critical or Warning findings');
-    expect(task).toContain('Fix them now');
-    expect(task).toContain('src/index.ts');
-    expect(task).toContain('abc123');
-    expect(task).toContain('## Critical');
-    expect(task).toContain('auto-review extension will re-check');
-  });
-
-  it('uses a longer markdown fence when reviewer output contains code fences', () => {
-    const task = buildAutoFixTask({
-      reviewText: '## Warnings\n```ts\nconst value = true;\n```',
-      changedFiles: ['src/index.ts'],
-      fingerprint: 'abc123',
-    });
-
-    expect(task).toContain('````markdown');
-    expect(task.trimEnd().endsWith('````')).toBe(true);
-  });
-});
-
-describe('buildReviewTask', () => {
-  it('includes changed files and asks for skill-aware read-only review', () => {
-    const task = buildReviewTask({ changedFiles: ['src/index.ts'], status: ' M src/index.ts' });
-    expect(task).toContain('src/index.ts');
-    expect(task).toContain('git diff');
-    expect(task).toContain('relevant skills');
-    expect(task).toContain('## Skills Used');
-    expect(task).toContain('Make skill usage visible');
-    expect(task).toContain('read-only');
-  });
-});
-
-describe('buildChildPiArgs', () => {
-  it('uses json print no-session mode and does not override model or thinking', () => {
-    const args = buildChildPiArgs('/tmp/meta.md', 'Review now');
-    expect(args).toEqual([
-      '--mode',
-      'json',
-      '-p',
-      '--no-session',
-      '--tools',
-      'read,grep,find,ls,bash',
-      '--append-system-prompt',
-      '/tmp/meta.md',
-      'Review now',
-    ]);
-    expect(args).not.toContain('--model');
-    expect(args).not.toContain('--thinking');
-  });
-});
-
-describe('extractFinalAssistantText', () => {
-  it('extracts the final assistant text from json mode output', () => {
-    const output = [
-      JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'first' }] } }),
-      JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'final' }] } }),
-    ].join('\n');
-    expect(extractFinalAssistantText(output)).toBe('final');
-  });
-
-  it('returns fallback text when no assistant output exists', () => {
-    expect(extractFinalAssistantText('not json')).toBe('(review completed with no assistant output)');
+    expect(prompt).toContain('git diff --no-ext-diff abc..def');
   });
 });
