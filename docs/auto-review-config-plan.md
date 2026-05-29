@@ -1,20 +1,20 @@
-# Auto Review Config Plan
+# Auto Review Config Implementation Notes
 
-> Forward-looking design note: this configuration layer is planned but not implemented yet.
+> Historical implementation notes for the `pi-auto-review` configuration layer. The feature is implemented; use `README.md` as the public user-facing reference.
 
 ## Goal
 
-Add global and project-level configuration for `pi-auto-review`, especially for controlling the bundled `pi-subagents` reviewer behavior and review/fix loop policy.
+Document the global and project-level configuration for `pi-auto-review`, especially for controlling review/fix loop policy and the currently supported reviewer-agent selection.
 
 ## 1. Config Schema
 
-Add a new file:
+Implemented in:
 
 ```text
 extensions/auto-review/config.ts
 ```
 
-Support:
+Supported schema:
 
 ```ts
 export interface AutoReviewConfig {
@@ -23,8 +23,10 @@ export interface AutoReviewConfig {
   reviewerSkills?: string[];
   reviewerTaskExtra?: string;
   autoFix?: boolean;
+  autoFixSuggestions?: boolean;
   blockInputDuringReview?: boolean;
   reviewStartWatchdogMs?: number;
+  maxReviewPasses?: number | null;
 }
 ```
 
@@ -37,8 +39,10 @@ Defaults:
   reviewerSkills: [],
   reviewerTaskExtra: '',
   autoFix: true,
+  autoFixSuggestions: false,
   blockInputDuringReview: true,
   reviewStartWatchdogMs: 30_000,
+  maxReviewPasses: null,
 }
 ```
 
@@ -57,12 +61,12 @@ Project config overrides global config.
 Behavior:
 
 - Missing file: ignore.
-- Invalid JSON: warn and ignore.
-- Unknown keys: ignore or warn.
+- Invalid JSON/read failure: ignore and fall back to lower-priority config/defaults.
+- Unknown keys: ignore.
 
 ## 3. Prompt Builder Changes
 
-Extend `ReviewPromptInput` in `helpers.ts`:
+`ReviewPromptInput` in `helpers.ts` includes the run context and effective review policy:
 
 ```ts
 interface ReviewPromptInput {
@@ -74,20 +78,19 @@ interface ReviewPromptInput {
   reviewerSkills: string[];
   reviewerTaskExtra?: string;
   autoFix: boolean;
+  autoFixSuggestions: boolean;
+  reviewPass?: number;
+  maxReviewPasses?: number | null;
 }
 ```
 
-Prompt should invoke the bundled skill command and pass only run-specific context:
+Prompt generation intentionally dispatches only the bundled skill command:
 
 ```text
 /skill:auto-review
-
-<!-- pi-auto-review-turn -->
-Review and fix the code changes from the previous turn.
-...
 ```
 
-The stable workflow lives in `skills/auto-review/SKILL.md`. Config-derived options such as `reviewerAgent`, `reviewerSkills`, `autoFix`, and `reviewerTaskExtra` should either be passed as concise context in the skill command arguments or represented by generated skill/config guidance.
+The stable workflow lives in `skills/auto-review/SKILL.md`. The skill reads the current git state and supported effective config itself, keeping the queued prompt minimal and avoiding duplicated run/config context in the prompt body. The minimal prompt path does not currently inject `reviewerSkills` or `reviewerTaskExtra` into the reviewer subagent call; wire those fields into the skill workflow before relying on them for reviewer customization.
 
 ## 4. Index Wiring
 
@@ -110,38 +113,38 @@ Priority:
 --no-auto-review flag > runtime /auto-review on/off > project config > global config > defaults
 ```
 
-Use config values when building the review prompt.
+Do not inject config values into the generated prompt; the queued prompt stays minimal and the auto-review skill reads config when it runs.
 
 ## 5. Guard Policy
 
-Use config to control guards:
+Use config to control queue behavior and skill workflow instructions:
 
-- `blockInputDuringReview: false` disables input blocking.
+- `blockInputDuringReview: false` disables input blocking while a review is queued but not yet dispatched.
 - `reviewStartWatchdogMs` controls watchdog timeout.
-- `autoFix: false` keeps review turn read-only for the whole turn.
-- `autoFix: true` allows fixes after configured reviewer subagent returns.
+- `autoFix: false` tells the auto-review skill to report findings without applying fixes.
+- `autoFix: true` allows the main agent to fix Critical/Warning findings after the configured reviewer subagent returns.
+- `autoFixSuggestions: false` keeps Suggestions report-only by default.
+- `maxReviewPasses` optionally limits repeated review/fix passes in one loop.
 
-Reviewer subagent completion should still be recognized only when the subagent input matches the configured reviewer agent.
+The extension intentionally does not enforce mutation-blocking guard hooks during the review turn. Workflow discipline is owned by `skills/auto-review/SKILL.md` and `pi-subagents`.
 
 ## 6. Tests
 
-Add tests for:
+Config-related tests cover:
 
 - Global config load.
 - Project config overrides global config.
-- Invalid JSON is ignored with warning.
-- Prompt starts with `/skill:auto-review` and includes `AUTO_REVIEW_PROMPT_MARKER`.
-- `reviewerAgent` appears in skill context and controls reviewer-completion guard.
-- `reviewerSkills` appears in skill context.
-- `reviewerTaskExtra` appears in skill context.
-- `autoFix: false` prompts no-fix behavior and keeps mutation guard enabled.
+- Invalid JSON/read failures fall back to lower-priority config/defaults.
+- Prompt generation is the minimal `/skill:auto-review` command.
+- The generated prompt does not duplicate changed files, reviewer settings, or review-pass context.
+- Config is loaded before dispatch while the generated prompt remains `/skill:auto-review`.
 - `blockInputDuringReview: false` does not block input.
 - Custom `reviewStartWatchdogMs` is used.
 - Runtime `/auto-review off/on` override still works.
 
 ## 7. README Updates
 
-Add a `Configuration` section.
+`README.md` includes a `Configuration` section.
 
 Global config path:
 
@@ -163,8 +166,10 @@ Example:
   "reviewerSkills": ["effect-ts-reviewer"],
   "reviewerTaskExtra": "Check Effect service/layer patterns.",
   "autoFix": true,
+  "autoFixSuggestions": false,
   "blockInputDuringReview": true,
-  "reviewStartWatchdogMs": 30000
+  "reviewStartWatchdogMs": 30000,
+  "maxReviewPasses": null
 }
 ```
 
@@ -185,12 +190,12 @@ pi remove /path/to/pi-auto-review || true
 pi install /path/to/pi-auto-review
 ```
 
-## 9. Implementation Order
+## 9. Historical Implementation Order
 
-1. Add `config.ts`.
-2. Extend `helpers.ts` prompt input and tests.
-3. Wire config into `index.ts`.
-4. Add config/guard tests.
-5. Update README.
-6. Run tests/typecheck.
-7. Reinstall local Pi package.
+1. Added `config.ts`.
+2. Extended `helpers.ts` prompt input and tests.
+3. Wired config into `index.ts`.
+4. Added config/queue-behavior tests.
+5. Updated README.
+6. Ran tests/typecheck.
+7. Reinstalled local Pi package.
