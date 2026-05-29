@@ -3,6 +3,10 @@
   "version": "0.2.1",
   "description": "Pi package that automatically queues a read-only code review after agent code changes.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jayjnu/pi-auto-review"
+  },
   "license": "MIT",
   "keywords": ["pi-package", "pi", "code-review", "agent"],
   "files": [
