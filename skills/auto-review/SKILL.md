@@ -10,15 +10,17 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
 ## Required Flow
 
 1. Treat the trigger prompt as intentionally minimal. Do not expect changed-file lists or diff details in the prompt.
-2. Use read-only inspection to determine the current review target: check `git status --porcelain`, `git diff --no-ext-diff`, `git diff --cached --no-ext-diff`, and recent `HEAD` changes if the worktree is clean.
-3. Determine `pi-auto-review` config from `.pi/extensions/auto-review/config.json` and `~/.pi/agent/extensions/auto-review/config.json` when relevant. Defaults are: `reviewerAgent: "reviewer"`, `autoFix: true`, `autoFixSuggestions: false`.
-4. First, call the `subagent` tool using the configured reviewer agent to review the current changes.
-5. Wait for the reviewer result.
-6. Before the reviewer result returns, do not edit, write, or otherwise mutate files. Use read-only inspection only.
-7. If fixes are allowed (`autoFix: true`) and the reviewer reports Critical or Warnings, apply concrete fixes now in the main session.
-8. Do not auto-fix Suggestions unless `autoFixSuggestions: true` is explicitly configured. By default, Suggestions are report-only.
-9. Do not continue iterative improvement beyond concrete Critical/Warning fixes in this pass.
-10. If fixes are disabled (`autoFix: false`) or there are no Critical or Warning findings, summarize the review and do not edit files.
+2. Before dispatching the reviewer subagent, decide whether there is a meaningful review target in the current context. Use the conversation, prior reviewer findings, recent tool results, and any known edits or fixes to judge whether another review is warranted.
+3. Read-only checks such as `git status --porcelain`, `git diff --no-ext-diff`, `git diff --cached --no-ext-diff`, or recent `HEAD` inspection may be useful supporting signals, but they are examples only. Do not treat them as the sole source of truth.
+4. If there is no plausible code change, unresolved reviewer finding, or other reviewable artifact to inspect, do not call the reviewer subagent. Output only a single muted/dim status line: `[auto-review] 리뷰할만한 변경이 없습니다` and stop.
+5. Determine `pi-auto-review` config from `.pi/extensions/auto-review/config.json` and `~/.pi/agent/extensions/auto-review/config.json` when relevant. Defaults are: `reviewerAgent: "reviewer"`, `autoFix: true`, `autoFixSuggestions: false`.
+6. If a review is warranted, call the `subagent` tool using the configured reviewer agent to review the identified target.
+7. Wait for the reviewer result.
+8. Before the reviewer result returns, do not edit, write, or otherwise mutate files. Use read-only inspection only.
+9. If fixes are allowed (`autoFix: true`) and the reviewer reports Critical or Warnings, apply concrete fixes now in the main session.
+10. Do not auto-fix Suggestions unless `autoFixSuggestions: true` is explicitly configured. By default, Suggestions are report-only.
+11. Do not continue iterative improvement beyond concrete Critical/Warning fixes in this pass.
+12. If fixes are disabled (`autoFix: false`) or there are no Critical or Warning findings, summarize the review and do not edit files.
 
 ## Context Rules
 

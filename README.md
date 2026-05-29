@@ -24,7 +24,9 @@ pi -e /path/to/pi-auto-review
 
 `pi-auto-review` runs once after an agent prompt changes code. It does not run after every individual edit. If the agent commits its changes and leaves a clean worktree, auto-review asks the main agent to review the committed range from the turn's starting `HEAD` to the ending `HEAD`.
 
-The package bundles `pi-subagents` and an `auto-review` skill. After Pi becomes idle, it queues a short `/skill:auto-review` main-agent orchestration turn. That skill tells the main agent to first call the `reviewer` subagent, then apply fixes in the main session when the reviewer reports Critical or Warning findings. That means:
+The package bundles `pi-subagents` and an `auto-review` skill. After Pi becomes idle, it queues a short `/skill:auto-review` main-agent orchestration turn.
+
+That skill tells the main agent to first decide whether the current context contains a meaningful review target, call the `reviewer` subagent only when a review is warranted, then apply fixes in the main session when the reviewer reports Critical or Warning findings. That means:
 
 - review context is isolated in a child Pi session via `pi-subagents`;
 - fixes happen in the visible main chat flow;
@@ -119,7 +121,7 @@ Priority: `--no-auto-review` flag > runtime `/auto-review on/off` > project conf
 
 ## Customizing Reviews
 
-Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, package skills, and `pi-subagents` reviewer configuration. The bundled `auto-review` skill prompts the main agent to call the configured reviewer subagent and then fix Critical/Warning findings.
+Define review expectations with normal Pi mechanisms: `AGENTS.md`, project skills, global skills, package skills, and `pi-subagents` reviewer configuration. The bundled `auto-review` skill prompts the main agent to use the conversation, recent tool results, known edits/fixes, and optional read-only checks as context before deciding whether to call the configured reviewer subagent. If there is no meaningful review target, the skill should stop without dispatching the reviewer.
 
 ## Safety
 
