@@ -97,8 +97,6 @@ Example config file:
 ```json
 {
   "reviewerAgent": "reviewer",
-  "reviewerSkills": ["effect-ts-reviewer"],
-  "reviewerTaskExtra": "Check Effect service/layer patterns.",
   "autoFix": true,
   "autoFixSuggestions": false,
   "blockInputDuringReview": true,
@@ -109,8 +107,8 @@ Example config file:
 
 - `enabled` — enable or disable automatic review (default: `true`).
 - `reviewerAgent` — the subagent name used for review (default: `reviewer`).
-- `reviewerSkills` — additional skills to inject into the reviewer subagent (default: `[]`).
-- `reviewerTaskExtra` — extra instructions appended to the reviewer task (default: `""`).
+- `reviewerSkills` — parsed config field reserved for reviewer customization; the bundled minimal prompt path does not currently inject these skills into the reviewer subagent (default: `[]`).
+- `reviewerTaskExtra` — parsed config field reserved for reviewer customization; the bundled minimal prompt path does not currently append this text to the reviewer task (default: `""`).
 - `autoFix` — allow the main agent to apply Critical/Warning fixes after the reviewer returns (default: `true`).
 - `autoFixSuggestions` — allow automatic fixing of Suggestions when safe and local (default: `false`). By default, Suggestions are report-only.
 - `blockInputDuringReview` — block new user messages while a review turn is queued but not yet dispatched (default: `true`).
