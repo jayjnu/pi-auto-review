@@ -9,23 +9,114 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
 
 ## Required Flow
 
-1. Treat the trigger prompt as intentionally minimal. Do not expect changed-file lists or diff details in the prompt.
-2. Before dispatching the reviewer subagent, decide whether there is a meaningful review target in the current context. Use the conversation, prior reviewer findings, recent tool results, and any known edits or fixes to judge whether another review is warranted.
-3. Read-only checks such as `git status --porcelain`, `git diff --no-ext-diff`, `git diff --cached --no-ext-diff`, or recent `HEAD` inspection may be useful supporting signals, but they are examples only. Do not treat them as the sole source of truth.
-4. If there is no plausible code change, unresolved reviewer finding, or other reviewable artifact to inspect, do not call the reviewer subagent. Output only a single muted/dim status line: `[auto-review] 리뷰할만한 변경이 없습니다` and stop.
-5. Determine `pi-auto-review` config from `.pi/extensions/auto-review/config.json` and `~/.pi/agent/extensions/auto-review/config.json` when relevant. Defaults are: `reviewerAgent: "reviewer"`, `autoFix: true`, `autoFixSuggestions: false`.
-6. If a review is warranted, call the `subagent` tool using the configured reviewer agent to review the identified target.
-7. Wait for the reviewer result.
-8. Before the reviewer result returns, do not edit, write, or otherwise mutate files. Use read-only inspection only.
-9. If fixes are allowed (`autoFix: true`) and the reviewer reports Critical or Warnings, apply concrete fixes now in the main session.
-10. Do not auto-fix Suggestions unless `autoFixSuggestions: true` is explicitly configured. By default, Suggestions are report-only.
-11. Do not continue iterative improvement beyond concrete Critical/Warning fixes in this pass.
-12. If fixes are disabled (`autoFix: false`) or there are no Critical or Warning findings, summarize the review and do not edit files.
+1. Treat the trigger prompt as intentionally minimal. Do not expect changed-file lists or diff details in the prompt for normal dirty-worktree reviews.
+2. If the trigger prompt includes an `Auto-review context` block with `Committed clean-worktree range: <before>..<after>`, use that compact range as the primary review target. Inspect the committed range with read-only commands such as `git diff --name-only <before>..<after>` and `git diff --no-ext-diff <before>..<after>`. Use any `Changed files:` line as a hint only; verify the range directly. Include this range context in every reviewer task so reviewers inspect the committed changes instead of the currently clean worktree.
+3. Before dispatching any subagent, decide whether there is a meaningful review target in the current context. Use the explicit committed range when present; otherwise use the conversation, prior reviewer findings, recent tool results, known edits/fixes, and read-only signals such as `git status --porcelain`, `git diff --no-ext-diff`, `git diff --cached --no-ext-diff`, or recent `HEAD` inspection.
+4. If there is no plausible code change, unresolved reviewer finding, or other reviewable artifact to inspect, do not call subagents. Output only a single muted/dim status line: `[auto-review] 리뷰할만한 변경이 없습니다` and stop.
+5. Determine the effective `pi-auto-review` config before fanout/fixer orchestration. Merge precedence is `defaults < global config (~/.pi/agent/extensions/auto-review/config.json) < project config (.pi/extensions/auto-review/config.json)`. Apply the same normalization as the extension: ignore unknown keys; ignore invalid or missing values and keep the lower-priority/default value; ignore empty `reviewerAgent`/`fixerAgent`; require booleans to be actual booleans; require positive numbers where numeric; require `reviewConcurrency` to be a positive integer capped at `8` and defaulting to `4`; require `maxReviewPasses` to be `null` or a positive integer; require `reviewerSkills`/`fixerSkills` to be string arrays in JSON config (the `/auto-review config set ...Skills a b` command accepts space-separated input because it writes an array). Defaults are:
+   - `enabled: true`
+   - `reviewerAgent: "reviewer"`
+   - `reviewerSkills: []`
+   - `reviewerTaskExtra: ""`
+   - `reviewConcurrency: 4` (maximum 8)
+   - `includeBaselineReview: true`
+   - `fixerAgent: "worker"`
+   - `fixerSkills: []`
+   - `fixerTaskExtra: ""`
+   - `autoFix: true`
+   - `autoFixSuggestions: false`
+   - `blockInputDuringReview: true`
+   - `reviewStartWatchdogMs: 30000`
+   - `maxReviewPasses: null`
+6. Build a **flat parallel reviewer fanout**. Do not create nested subagent fanout from a reviewer.
+   - If `includeBaselineReview` is not `false`, include **three separate baseline reviewer tasks by default**, even when no `reviewerSkills` are configured:
+     1. correctness/regressions/edge cases/unintended side effects;
+     2. tests/validation/build confidence and missing verification;
+     3. simplicity/maintainability/API clarity/code organization.
+   - For every configured `reviewerSkills` entry, add one additional separate reviewer task using the same `reviewerAgent` and `skill: [thatSkill]`. Each skill gets its own reviewer so perspectives stay isolated.
+   - If the flat list would otherwise be empty because baseline review is disabled and no `reviewerSkills` are configured, add one minimal fallback reviewer for correctness/regressions so `/skill:auto-review` still performs a review.
+   - Assign a visible prompt label to every reviewer task even though the subagent UI still shows the underlying `agent` name:
+     - baseline labels: `[auto-review:correctness]`, `[auto-review:validation]`, `[auto-review:maintainability]`;
+     - configured skill labels: `[auto-review:skill:<skill-name>]`;
+     - fallback label: `[auto-review:fallback-correctness]`.
+   - Put the label at the very start of the task text and require the reviewer to start its response with `Reviewer: <same-label>`. This does not rename the subagent, but it makes task previews and returned results distinguishable.
+   - When a committed clean-worktree range is present, include `Review target: committed range <before>..<after>` in every reviewer task and tell reviewers to inspect that range directly.
+   - Append `reviewerTaskExtra` to every reviewer task when non-empty.
+7. Run all reviewer tasks in one `subagent({ tasks: [...], concurrency, context: "fresh" })` call.
+   - Use `concurrency: reviewConcurrency` (configured values are bounded to a maximum of 8).
+   - Every reviewer task must say: `Do not modify project/source files; returning findings in your response is allowed.`
+   - Ask reviewers to inspect the actual current diff/changed files directly, not just prior summaries.
+   - Ask reviewers to return `Reviewer: <label>`, `Critical`, `Warnings`, `Suggestions`, and `Files Reviewed` with file/line evidence where possible.
+8. Wait for all reviewer results, then synthesize them in the main session.
+   - Deduplicate overlapping findings.
+   - Separate `Critical`, `Warnings`, `Suggestions`, and feedback to ignore/defer.
+   - Treat Suggestions as report-only unless `autoFixSuggestions: true`.
+9. The main session is the orchestrator/synthesizer, not the writer. Do **not** directly edit, write, or run mutating commands for fixes.
+10. If fixes are allowed (`autoFix: true`) and the synthesized results contain Critical or Warning findings, call exactly one fixer subagent using `fixerAgent`.
+   - Pass only accepted Critical/Warning fixes.
+   - Include Suggestions only when `autoFixSuggestions: true` and they are safe, local, and inside the approved scope.
+   - Pass `skill: fixerSkills` when configured.
+   - Append `fixerTaskExtra` when non-empty.
+   - The fixer is the only writer for this auto-review pass.
+11. Wait for the fixer result. It must report changed files, fixes applied, validation commands/results, failures, remaining risks, and any decisions that need approval.
+12. Do not continue iterative improvement beyond concrete accepted fixes in this pass. If the fixer changes files, `pi-auto-review` may queue another pass according to `maxReviewPasses`.
+13. If fixes are disabled (`autoFix: false`) or there are no Critical/Warning findings, summarize the review and do not edit files.
+
+## Reviewer Fanout Task Shape
+
+Use this pattern, adapted to the actual config:
+
+```typescript
+subagent({
+  tasks: [
+    {
+      agent: reviewerAgent,
+      task: "[auto-review:correctness]\nStart your response with: Reviewer: [auto-review:correctness]\n\nReview the current diff for correctness, regressions, edge cases, and unintended side effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      output: false
+    },
+    {
+      agent: reviewerAgent,
+      task: "[auto-review:validation]\nStart your response with: Reviewer: [auto-review:validation]\n\nReview the current diff for tests, validation quality, build confidence, and missing verification. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      output: false
+    },
+    {
+      agent: reviewerAgent,
+      task: "[auto-review:maintainability]\nStart your response with: Reviewer: [auto-review:maintainability]\n\nReview the current diff for simplicity, maintainability, API clarity, naming, and code organization. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      output: false
+    },
+    {
+      agent: reviewerAgent,
+      skill: ["frontend-review"],
+      task: "[auto-review:skill:frontend-review]\nStart your response with: Reviewer: [auto-review:skill:frontend-review]\n\nReview the current diff from the frontend-review perspective: React, UI behavior, UX, accessibility, styling, component state, and user interactions. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      output: false
+    }
+  ],
+  concurrency: reviewConcurrency,
+  context: "fresh"
+})
+```
+
+## Fixer Task Shape
+
+Use this pattern only after synthesizing accepted fixes:
+
+```typescript
+subagent({
+  agent: fixerAgent,
+  // Include this field only when fixerSkills is non-empty:
+  // skill: fixerSkills,
+  task: "Apply only the accepted auto-review fixes below. You are the sole writer for this pass. Preserve user-approved scope. Do not fix Suggestions unless explicitly listed. Do not spawn subagents. Run focused validation when possible and report changed files, fixes applied, validation commands/results, failures, remaining risks, and decisions needing approval.\n\nAccepted fixes:\n...",
+  context: "fork"
+})
+```
+
+When `fixerSkills` is empty, omit the `skill` field entirely; still call exactly one fixer subagent.
 
 ## Context Rules
 
 - You are the main Pi agent, so use the current chat context and project instructions while orchestrating review/fix.
-- The reviewer subagent provides isolated review context; fixes are applied by you in this main session after reviewer results return.
+- Reviewer subagents provide isolated read-only review perspectives.
+- The fixer subagent is the single writer when auto-fix is enabled and accepted fixes exist.
 - If relevant skills are available, read and follow them, and report which skills you used.
 - Report concrete findings with file paths and line numbers when possible.
 
@@ -37,6 +128,8 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
 ## Critical
 ## Warnings
 ## Suggestions
+## Fixes Applied
+## Validation
 ## Files Reviewed
 ```
 
@@ -71,6 +164,11 @@ When the user says something like the following, translate it into the correspon
 | "auto review 설정 보여줘" / "show auto review settings" / "what is the current config?" | Say: `Run "/auto-review config" to view settings.` |
 | "auto review 설정 바꾸고 싶어" / "change auto review config" / "set X to Y" | Identify the key and value, then say: `Run "/auto-review config set <key> <value>".` |
 | "리뷰어를 custom-agent로 바꿔줘" / "use my-reviewer as reviewer" | Say: `Run "/auto-review config set reviewerAgent my-reviewer".` |
+| "리뷰 skill을 frontend-review effect-ts-reviewer로 나눠서 돌려" | Say: `Run "/auto-review config set reviewerSkills frontend-review effect-ts-reviewer".` |
+| "기본 correctness 리뷰는 빼줘" | Say: `Run "/auto-review config set includeBaselineReview false".` |
+| "리뷰 병렬도를 2로 해줘" | Say: `Run "/auto-review config set reviewConcurrency 2".` |
+| "fixer를 auto-review-fixer로 바꿔줘" | Say: `Run "/auto-review config set fixerAgent auto-review-fixer".` |
+| "fixer에 effect-typescript skill을 넣어줘" | Say: `Run "/auto-review config set fixerSkills effect-typescript".` |
 | "수정은 하지 말고 리뷰만 해줘" / "don't auto-fix, just review" | Say: `Run "/auto-review config set autoFix false".` |
 | "suggestion은 고치지 말고 보고만 해" / "don't fix suggestions" | Say: `Run "/auto-review config set autoFixSuggestions false".` |
 | "suggestion도 자동으로 고쳐줘" / "auto-fix suggestions too" | Say: `Run "/auto-review config set autoFixSuggestions true".` |
@@ -86,9 +184,14 @@ When the user says something like the following, translate it into the correspon
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable/disable automatic review |
 | `reviewerAgent` | string | `"reviewer"` | Subagent name for review |
-| `reviewerSkills` | string[] | `[]` | Extra skills for reviewer (JSON or space-separated) |
-| `reviewerTaskExtra` | string | `""` | Extra instructions appended to task |
-| `autoFix` | boolean | `true` | Allow Critical/Warning fixes after reviewer returns |
+| `reviewerSkills` | string[] | `[]` | Extra review skills; each skill becomes its own flat parallel reviewer task |
+| `reviewerTaskExtra` | string | `""` | Extra instructions appended to every reviewer task |
+| `reviewConcurrency` | number | `4` | Max concurrent flat reviewer tasks; capped at `8` |
+| `includeBaselineReview` | boolean | `true` | Include the default baseline reviewer set: correctness, tests/validation, and simplicity/maintainability |
+| `fixerAgent` | string | `"worker"` | Single writer subagent used for accepted auto-fixes |
+| `fixerSkills` | string[] | `[]` | Extra skills injected into the fixer subagent |
+| `fixerTaskExtra` | string | `""` | Extra instructions appended to the fixer task |
+| `autoFix` | boolean | `true` | Allow Critical/Warning fixes after reviewers return |
 | `autoFixSuggestions` | boolean | `false` | Allow automatic fixing of Suggestions |
 | `blockInputDuringReview` | boolean | `true` | Block user input while a review turn is queued but not yet dispatched |
 | `reviewStartWatchdogMs` | number | `30000` | Timeout before dropping a stuck queued review |
@@ -99,7 +202,8 @@ When the user says something like the following, translate it into the correspon
 - Do not claim that commands in assistant text execute automatically. Tell the user the exact `/auto-review` command to run.
 - Do **not** manually create or edit `.pi/extensions/auto-review/config.json`. The extension handles file I/O.
 - For boolean values, only `true` or `false` are valid.
-- For `reviewerSkills`, space-separated shorthand is accepted: `"skill-a skill-b"`.
+- For `reviewerSkills` and `fixerSkills`, space-separated shorthand is accepted: `"skill-a skill-b"`.
+- For `reviewConcurrency`, use a positive integer no greater than `8`.
 - For `maxReviewPasses`, use a positive integer or `unlimited`/`none`/`null`.
 - If the user is unsure what a key does, use `/auto-review config get <key>`.
 - If the user wants to see everything, use `/auto-review config`.

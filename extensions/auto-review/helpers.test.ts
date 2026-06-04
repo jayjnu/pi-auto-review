@@ -2,8 +2,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { getMergedConfig } from './config.ts';
-import { AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
+import { getMergedConfig, parseConfigValue } from './config.ts';
+import { AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 const tempDirs: string[] = [];
 
@@ -223,26 +223,40 @@ describe('shouldRunReview', () => {
 });
 
 describe('buildReviewPrompt', () => {
-  it('builds a minimal skill invocation prompt', () => {
-    const prompt = buildReviewPrompt({
-      changedFiles: ['src/index.ts'],
-      status: ' M src/index.ts',
-      beforeHead: 'abc',
-      afterHead: 'def',
-      reviewerAgent: 'custom-reviewer',
-      reviewerSkills: ['effect-ts-reviewer'],
-      reviewerTaskExtra: 'Check Effect service patterns.',
-      autoFix: false,
-      autoFixSuggestions: true,
-      reviewPass: 2,
-      maxReviewPasses: 3,
-    });
+  it('builds a minimal skill invocation prompt by default', () => {
+    const prompt = buildReviewPrompt();
 
     expect(prompt).toBe(AUTO_REVIEW_SKILL_COMMAND);
     expect(prompt).not.toContain('src/index.ts');
     expect(prompt).not.toContain('git diff --no-ext-diff');
     expect(prompt).not.toContain('Reviewer agent:');
     expect(prompt).not.toContain('Review pass:');
+  });
+
+  it('keeps dirty-worktree review prompts minimal even when HEAD changed', () => {
+    const prompt = buildReviewPrompt({
+      changedFiles: ['src/index.ts'],
+      status: ' M src/index.ts',
+      beforeHead: 'abc',
+      afterHead: 'def',
+    });
+
+    expect(prompt).toBe(AUTO_REVIEW_SKILL_COMMAND);
+  });
+
+  it('includes compact committed range context for clean-worktree committed changes', () => {
+    const prompt = buildReviewPrompt({
+      changedFiles: ['src/index.ts', 'README.md', 'src/index.ts'],
+      status: '',
+      beforeHead: 'abc',
+      afterHead: 'def',
+    });
+
+    expect(prompt).toContain(AUTO_REVIEW_SKILL_COMMAND);
+    expect(prompt).toContain('Auto-review context:');
+    expect(prompt).toContain('Committed clean-worktree range: abc..def');
+    expect(prompt).toContain('Changed files: "README.md", "src/index.ts"');
+    expect(prompt).not.toContain('diff --git');
   });
 });
 
@@ -254,6 +268,11 @@ describe('getMergedConfig', () => {
     expect(config.reviewerAgent).toBe('reviewer');
     expect(config.reviewerSkills).toEqual([]);
     expect(config.reviewerTaskExtra).toBe('');
+    expect(config.reviewConcurrency).toBe(4);
+    expect(config.includeBaselineReview).toBe(true);
+    expect(config.fixerAgent).toBe('worker');
+    expect(config.fixerSkills).toEqual([]);
+    expect(config.fixerTaskExtra).toBe('');
     expect(config.autoFix).toBe(true);
     expect(config.autoFixSuggestions).toBe(false);
     expect(config.blockInputDuringReview).toBe(true);
@@ -293,13 +312,24 @@ describe('getMergedConfig', () => {
     expect((config as unknown as Record<string, unknown>).unknownKey).toBeUndefined();
   });
 
-  it('filters non-array reviewerSkills and non-string items', () => {
+  it('trims valid reviewerSkills/fixerSkills from config files', () => {
     const dir = createTempDir();
     fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerSkills: ['valid', 123, null] }));
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerSkills: [' effect-ts-re ', 'reviewer'], fixerSkills: [' fixer-skill '] }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewerSkills).toEqual(['effect-ts-re', 'reviewer']);
+    expect(config.fixerSkills).toEqual(['fixer-skill']);
+  });
+
+  it('filters non-array reviewerSkills/fixerSkills, non-string items, and empty strings', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerSkills: ['valid', 123, null], fixerSkills: ['valid', '', '   '] }));
 
     const config = getMergedConfig(dir, dir);
     expect(config.reviewerSkills).toEqual([]);
+    expect(config.fixerSkills).toEqual([]);
   });
 
   it('ignores non-finite reviewStartWatchdogMs', () => {
@@ -311,13 +341,23 @@ describe('getMergedConfig', () => {
     expect(config.reviewStartWatchdogMs).toBe(30_000);
   });
 
-  it('ignores empty-string reviewerAgent and falls back to default', () => {
+  it('clamps config-file reviewConcurrency to the safe maximum', () => {
     const dir = createTempDir();
     fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerAgent: '' }));
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewConcurrency: 99 }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewConcurrency).toBe(8);
+  });
+
+  it('ignores empty-string reviewerAgent/fixerAgent and falls back to defaults', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerAgent: '', fixerAgent: '' }));
 
     const config = getMergedConfig(dir, dir);
     expect(config.reviewerAgent).toBe('reviewer');
+    expect(config.fixerAgent).toBe('worker');
   });
 
   it('ignores non-positive reviewStartWatchdogMs and falls back to default', () => {
@@ -327,6 +367,50 @@ describe('getMergedConfig', () => {
 
     const config = getMergedConfig(dir, dir);
     expect(config.reviewStartWatchdogMs).toBe(30_000);
+  });
+});
+
+describe('isAutoReviewFixerSubagentInput', () => {
+  it('detects single, parallel, and chain fixer subagent inputs', () => {
+    expect(isAutoReviewFixerSubagentInput({ agent: 'worker', task: 'fix' })).toBe(true);
+    expect(isAutoReviewFixerSubagentInput({ tasks: [{ agent: 'reviewer', task: 'review' }, { agent: 'worker', task: 'fix' }] })).toBe(true);
+    expect(isAutoReviewFixerSubagentInput({ chain: [{ agent: 'reviewer', task: 'review' }, { agent: 'worker', task: 'fix' }] })).toBe(true);
+    expect(isAutoReviewFixerSubagentInput({ chain: [{ parallel: [{ agent: 'worker', task: 'fix' }] }] })).toBe(true);
+  });
+
+  it('rejects reviewer-only and non-target fixer inputs', () => {
+    expect(isAutoReviewFixerSubagentInput({ agent: 'reviewer', task: 'review' })).toBe(false);
+    expect(isAutoReviewFixerSubagentInput({ tasks: [{ agent: 'reviewer', task: 'a' }] })).toBe(false);
+    expect(isAutoReviewFixerSubagentInput({ agent: 'custom-fixer', task: 'fix' }, 'worker')).toBe(false);
+    expect(isAutoReviewFixerSubagentInput({ agent: 'custom-fixer', task: 'fix' }, 'custom-fixer')).toBe(true);
+    expect(isAutoReviewFixerSubagentInput(undefined)).toBe(false);
+  });
+});
+
+describe('parseConfigValue skill arrays', () => {
+  it('trims JSON array skill values', () => {
+    expect(parseConfigValue('reviewerSkills', '[" effect-ts-re ", "reviewer"]')).toEqual(['effect-ts-re', 'reviewer']);
+    expect(parseConfigValue('fixerSkills', '[" fixer-skill "]')).toEqual(['fixer-skill']);
+  });
+
+  it('rejects empty or whitespace-only JSON array skill values', () => {
+    expect(() => parseConfigValue('reviewerSkills', '["valid", ""]')).toThrow('non-empty strings');
+    expect(() => parseConfigValue('fixerSkills', '["valid", "   "]')).toThrow('non-empty strings');
+  });
+
+  it('rejects malformed JSON-looking skill array values instead of treating them as shorthand', () => {
+    expect(() => parseConfigValue('reviewerSkills', '["skill",]')).toThrow('Expected JSON array or space-separated list for reviewerSkills');
+    expect(() => parseConfigValue('fixerSkills', '{"skill":true')).toThrow('Expected JSON array or space-separated list for fixerSkills');
+  });
+
+  it('rejects non-array JSON skill values instead of treating them as shorthand', () => {
+    expect(() => parseConfigValue('reviewerSkills', '{"skill":"effect-ts-re"}')).toThrow('Expected JSON array or space-separated list for reviewerSkills');
+    expect(() => parseConfigValue('fixerSkills', '"fixer-skill"')).toThrow('Expected JSON array or space-separated list for fixerSkills');
+  });
+
+  it('preserves space-separated shorthand filtering', () => {
+    expect(parseConfigValue('reviewerSkills', '  effect-ts-re   reviewer  ')).toEqual(['effect-ts-re', 'reviewer']);
+    expect(parseConfigValue('fixerSkills', '  fixer-skill  ')).toEqual(['fixer-skill']);
   });
 });
 

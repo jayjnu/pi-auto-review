@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AutoReviewConfig, ConfigKey } from './config.ts';
 import { getMergedConfig, getProjectConfigPath, initProjectConfig, isValidConfigKey, parseConfigValue, readProjectConfig, formatConfigValue, writeProjectConfig } from './config.ts';
-import { areSkillCommandsEnabled, buildReviewPrompt, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
+import { areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 export default function autoReviewExtension(pi: ExtensionAPI) {
   let config: Required<AutoReviewConfig> | undefined;
@@ -11,8 +11,13 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   let reviewPassCount = 0;
   let queuedReviewPass = 0;
   let sawMutationTool = false;
+  let sawFixerSubagent = false;
+  let capturedFixerDiffSnapshot = false;
   let beforeStatus = '';
   let beforeHead = '';
+  let beforeFixerWorktreeDiff = '';
+  let beforeFixerCachedDiff = '';
+  let beforeFixerUntrackedSnapshot = '';
   let lastQueuedReviewFingerprint = '';
   let queuedReviewPrompt: string | undefined;
   let reviewStartTimer: ReturnType<typeof setTimeout> | undefined;
@@ -52,7 +57,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     return createHash('sha256').update(value).digest('hex');
   }
 
-  function buildReviewFingerprint(input: { status: string; beforeHead: string; afterHead: string; files: string[]; worktreeDiff: string; cachedDiff: string }): string {
+  function buildReviewFingerprint(input: { status: string; beforeHead: string; afterHead: string; files: string[]; worktreeDiff: string; cachedDiff: string; untrackedSnapshot: string }): string {
     return JSON.stringify({
       status: input.status.trim(),
       beforeHead: input.beforeHead.trim(),
@@ -60,6 +65,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
       files: [...input.files].sort(),
       worktreeDiffHash: hashReviewContent(input.worktreeDiff),
       cachedDiffHash: hashReviewContent(input.cachedDiff),
+      untrackedSnapshotHash: hashReviewContent(input.untrackedSnapshot),
     });
   }
 
@@ -207,9 +213,47 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     },
   });
 
+  function formatGitOutput(result: { stdout: string; stderr?: string; code: number }): string {
+    return result.code === 0 ? result.stdout : `${result.code}:${result.stderr ?? ''}`;
+  }
+
   async function getHead(signal?: AbortSignal): Promise<string> {
     const result = await pi.exec('git', ['rev-parse', '--verify', 'HEAD'], { signal });
     return result.code === 0 ? result.stdout.trim() : '';
+  }
+
+  async function getWorktreeDiff(signal?: AbortSignal): Promise<string> {
+    return formatGitOutput(await pi.exec('git', ['diff', '--no-ext-diff'], { signal }));
+  }
+
+  async function getCachedDiff(signal?: AbortSignal): Promise<string> {
+    return formatGitOutput(await pi.exec('git', ['diff', '--cached', '--no-ext-diff'], { signal }));
+  }
+
+  function hasUntrackedFiles(status: string): boolean {
+    return status.split('\n').some((line) => line.startsWith('?? '));
+  }
+
+  async function getUntrackedFileSnapshot(signal?: AbortSignal): Promise<string> {
+    const listed = await pi.exec('git', ['ls-files', '--others', '--exclude-standard', '-z'], { signal });
+    if (listed.code !== 0) return `${listed.code}:${listed.stderr ?? ''}`;
+
+    const files = listed.stdout.split('\0').filter(Boolean).sort();
+    if (files.length === 0) return '';
+
+    const entries: Array<[string, string]> = [];
+    const chunkSize = 100;
+    for (let index = 0; index < files.length; index += chunkSize) {
+      const chunk = files.slice(index, index + chunkSize);
+      const hashed = await pi.exec('git', ['hash-object', '--', ...chunk], { signal });
+      if (hashed.code !== 0) return JSON.stringify({ files, error: `${hashed.code}:${hashed.stderr ?? ''}` });
+      const hashes = hashed.stdout.split('\n').filter(Boolean);
+      for (let offset = 0; offset < chunk.length; offset += 1) {
+        entries.push([chunk[offset] ?? '', hashes[offset] ?? '']);
+      }
+    }
+
+    return JSON.stringify(entries);
   }
 
   pi.on('session_start', async (_event, ctx) => {
@@ -249,12 +293,25 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     // instead of detecting and guarding a special marker-bearing turn.
   });
 
-  pi.on('tool_call', async () => {
-    // Intentionally no-op; pi-subagents and the auto-review skill own workflow discipline.
+  pi.on('tool_call', async (event, ctx) => {
+    if (event.toolName !== 'subagent') return;
+    const input = event.input && typeof event.input === 'object' ? event.input as Record<string, unknown> : undefined;
+    if (!isAutoReviewFixerSubagentInput(input, config?.fixerAgent ?? 'worker')) return;
+    if (capturedFixerDiffSnapshot) return;
+
+    beforeFixerWorktreeDiff = await getWorktreeDiff(ctx.signal);
+    beforeFixerCachedDiff = await getCachedDiff(ctx.signal);
+    beforeFixerUntrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
+    capturedFixerDiffSnapshot = true;
   });
 
   pi.on('agent_start', async (_event, ctx) => {
     sawMutationTool = false;
+    sawFixerSubagent = false;
+    capturedFixerDiffSnapshot = false;
+    beforeFixerWorktreeDiff = '';
+    beforeFixerCachedDiff = '';
+    beforeFixerUntrackedSnapshot = '';
 
     const status = await pi.exec('git', ['status', '--porcelain'], { signal: ctx.signal });
     beforeStatus = status.code === 0 ? status.stdout : '';
@@ -269,18 +326,41 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
       const command = typeof event.input?.command === 'string' ? event.input.command : '';
       if (isLikelyMutatingBashCommand(command)) sawMutationTool = true;
     }
+    if (event.toolName === 'subagent') {
+      const input = event.input && typeof event.input === 'object' ? event.input as Record<string, unknown> : undefined;
+      if (isAutoReviewFixerSubagentInput(input, config?.fixerAgent ?? 'worker')) sawFixerSubagent = true;
+    }
   });
 
   pi.on('agent_end', async (_event, ctx) => {
     const status = await pi.exec('git', ['status', '--porcelain'], { signal: ctx.signal });
     const afterStatus = status.code === 0 ? status.stdout : '';
     const afterHead = await getHead(ctx.signal);
+    let worktreeDiff: string | undefined;
+    let cachedDiff: string | undefined;
+    let untrackedSnapshot: string | undefined;
+
+    if (capturedFixerDiffSnapshot) {
+      worktreeDiff = await getWorktreeDiff(ctx.signal);
+      cachedDiff = await getCachedDiff(ctx.signal);
+      untrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
+    }
+
+    const fixerChangedGitState = sawFixerSubagent && (
+      beforeStatus.trim() !== afterStatus.trim()
+      || beforeHead.trim() !== afterHead.trim()
+      || (capturedFixerDiffSnapshot && (
+        beforeFixerWorktreeDiff !== (worktreeDiff ?? '')
+        || beforeFixerCachedDiff !== (cachedDiff ?? '')
+        || beforeFixerUntrackedSnapshot !== (untrackedSnapshot ?? '')
+      ))
+    );
 
     if (!shouldRunReview({
       enabled: isEnabled(),
       reviewQueued,
       reviewInProgress: false,
-      sawMutationTool,
+      sawMutationTool: sawMutationTool || fixerChangedGitState,
       beforeStatus,
       afterStatus,
       beforeHead,
@@ -298,15 +378,19 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
       ...(committedFiles.code === 0 ? committedFiles.stdout.split('\0').filter(Boolean) : []),
     ]));
 
-    const worktreeDiff = await pi.exec('git', ['diff', '--no-ext-diff'], { signal: ctx.signal });
-    const cachedDiff = await pi.exec('git', ['diff', '--cached', '--no-ext-diff'], { signal: ctx.signal });
+    worktreeDiff ??= await getWorktreeDiff(ctx.signal);
+    cachedDiff ??= await getCachedDiff(ctx.signal);
+    if (untrackedSnapshot === undefined && hasUntrackedFiles(afterStatus)) {
+      untrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
+    }
     const reviewFingerprint = buildReviewFingerprint({
       status: afterStatus,
       beforeHead,
       afterHead,
       files: allChangedFiles,
-      worktreeDiff: worktreeDiff.code === 0 ? worktreeDiff.stdout : `${worktreeDiff.code}:${worktreeDiff.stderr}`,
-      cachedDiff: cachedDiff.code === 0 ? cachedDiff.stdout : `${cachedDiff.code}:${cachedDiff.stderr}`,
+      worktreeDiff,
+      cachedDiff,
+      untrackedSnapshot: untrackedSnapshot ?? '',
     });
     if (reviewFingerprint === lastQueuedReviewFingerprint) return;
 
@@ -321,13 +405,6 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
       status: afterStatus,
       beforeHead,
       afterHead,
-      reviewerAgent: config?.reviewerAgent ?? 'reviewer',
-      reviewerSkills: config?.reviewerSkills ?? [],
-      reviewerTaskExtra: config?.reviewerTaskExtra,
-      autoFix: config?.autoFix ?? true,
-      autoFixSuggestions: config?.autoFixSuggestions ?? false,
-      reviewPass: reviewPassCount + 1,
-      maxReviewPasses,
     });
 
     lastQueuedReviewFingerprint = reviewFingerprint;

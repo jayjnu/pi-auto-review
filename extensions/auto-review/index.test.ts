@@ -169,7 +169,54 @@ describe('autoReviewExtension', () => {
     expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
   });
 
-  it('queues a main-agent follow-up review for committed clean-worktree changes', async () => {
+  it('captures full diff snapshots lazily only when a fixer subagent is about to run', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let diffCalls = 0;
+    let currentWorktreeDiff = 'diff -- old content\n';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff')) {
+        diffCalls += 1;
+        if (!args.includes('--cached')) return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    expect(diffCalls).toBe(0);
+
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    expect(diffCalls).toBe(2);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    expect(diffCalls).toBe(2);
+
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'reviewer', task: 'review' } }, ctx);
+    expect(diffCalls).toBe(2);
+
+    const fixerInput = { agent: 'worker', task: 'fix accepted findings' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: fixerInput }, ctx);
+    expect(diffCalls).toBe(4);
+
+    currentWorktreeDiff = 'diff -- fixer content\n';
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: fixerInput, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    expect(diffCalls).toBe(6);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('queues a compact committed range review prompt for committed clean-worktree changes', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     let revParseCalls = 0;
@@ -179,7 +226,7 @@ describe('autoReviewExtension', () => {
         revParseCalls += 1;
         return { stdout: `${revParseCalls === 1 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
       }
-      if (command === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { stdout: 'src/index.ts\0', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { stdout: 'src/index.ts\0README.md\0', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -191,7 +238,11 @@ describe('autoReviewExtension', () => {
 
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    expect(prompt).toContain('/skill:auto-review');
+    expect(prompt).toContain('Committed clean-worktree range: abc..def');
+    expect(prompt).toContain('Changed files: "README.md", "src/index.ts"');
+    expect(prompt).not.toContain('diff --git');
   });
 
   it('clears queued review state if starting the review turn fails', async () => {
@@ -392,13 +443,12 @@ describe('autoReviewExtension', () => {
   it('queues another review when same-file diff content changes with unchanged status', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
-    let diffCalls = 0;
+    let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
       if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
-        diffCalls += 1;
-        return { stdout: diffCalls === 1 ? 'diff -- old content\n' : 'diff -- new content\n', stderr: '', code: 0 };
+        return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
     });
@@ -413,6 +463,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.before_agent_start[0]({ prompt }, ctx);
     await pi.handlers.agent_start[0]({}, ctx);
     await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
+    currentWorktreeDiff = 'diff -- new content\n';
     await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'echo fix > src/index.ts' }, isError: false }, ctx);
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
@@ -449,6 +500,175 @@ describe('autoReviewExtension', () => {
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
     expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
+  });
+
+  it('queues another review after the configured fixer subagent changes same-file diff content', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let currentWorktreeDiff = 'diff -- old content\n';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+        return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'reviewer' }, isError: false }, ctx);
+    const fixerInput = { agent: 'worker', task: 'fix accepted findings' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: fixerInput }, ctx);
+    currentWorktreeDiff = 'diff -- fixer content\n';
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: fixerInput, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('queues another review after an errored configured fixer subagent changes same-file diff content', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let currentWorktreeDiff = 'diff -- old content\n';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+        return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    const fixerInput = { agent: 'worker', task: 'fix accepted findings' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: fixerInput }, ctx);
+    currentWorktreeDiff = 'diff -- partial errored fixer content\n';
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: fixerInput, isError: true }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('queues another review after the configured fixer subagent changes already-untracked file content', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let untrackedContentHash = 'old-untracked-hash';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: '?? generated.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'ls-files' && args.includes('--others')) return { stdout: 'generated.ts\0', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'hash-object') return { stdout: `${untrackedContentHash}\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'write', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    const fixerInput = { agent: 'worker', task: 'fix accepted findings in generated.ts' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: fixerInput }, ctx);
+    untrackedContentHash = 'new-untracked-hash';
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: fixerInput, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not queue another review after the default fixer agent runs without changing git state', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+        return { stdout: 'diff -- unchanged dirty content\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    const workerInput = { agent: 'worker', task: 'unrelated worker that only reports status' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: workerInput }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: workerInput, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('queues another review after a custom configured fixer subagent changes same-file diff content', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ fixerAgent: 'auto-review-fixer' }));
+    let currentWorktreeDiff = 'diff -- old content\n';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+        return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const prompt = pi.sendUserMessage.mock.calls[0][0];
+    await pi.handlers.before_agent_start[0]({ prompt }, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: { agent: 'worker', task: 'unrelated worker should not count as fixer' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    await pi.handlers.agent_start[0]({}, ctx);
+    const fixerInput = { agent: 'auto-review-fixer', task: 'fix accepted findings' };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input: fixerInput }, ctx);
+    currentWorktreeDiff = 'diff -- custom fixer content\n';
+    await pi.handlers.tool_result[0]({ toolName: 'subagent', input: fixerInput, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
   it('does not schedule another review after the review turn ends without fixes', async () => {
@@ -681,6 +901,9 @@ describe('autoReviewExtension', () => {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.enabled).toBe(true);
     expect(parsed.reviewerAgent).toBe('reviewer');
+    expect(parsed.reviewConcurrency).toBe(4);
+    expect(parsed.includeBaselineReview).toBe(true);
+    expect(parsed.fixerAgent).toBe('worker');
   });
 
   it('config init fails if config already exists', async () => {
@@ -714,7 +937,7 @@ describe('autoReviewExtension', () => {
     expect(parsed.autoFix).toBe(false);
   });
 
-  it('config set handles array values for reviewerSkills', async () => {
+  it('config set handles array values for reviewerSkills and fixerSkills', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();
     const ctx = createFakeContext();
@@ -723,14 +946,17 @@ describe('autoReviewExtension', () => {
     autoReviewExtension(pi as never);
     await pi.handlers.session_start[0]({}, ctx);
     await pi.commands['auto-review'].handler('config set reviewerSkills effect-ts-re reviewer', ctx);
+    await pi.commands['auto-review'].handler('config set fixerSkills effect-typescript', ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Set reviewerSkills'), 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Set fixerSkills'), 'info');
     const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.reviewerSkills).toEqual(['effect-ts-re', 'reviewer']);
+    expect(parsed.fixerSkills).toEqual(['effect-typescript']);
   });
 
-  it('config set handles autoFixSuggestions boolean values', async () => {
+  it('config set handles autoFixSuggestions and includeBaselineReview boolean values', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();
     const ctx = createFakeContext();
@@ -739,11 +965,45 @@ describe('autoReviewExtension', () => {
     autoReviewExtension(pi as never);
     await pi.handlers.session_start[0]({}, ctx);
     await pi.commands['auto-review'].handler('config set autoFixSuggestions true', ctx);
+    await pi.commands['auto-review'].handler('config set includeBaselineReview false', ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith('Set autoFixSuggestions = true', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Set includeBaselineReview = false', 'info');
     const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.autoFixSuggestions).toBe(true);
+    expect(parsed.includeBaselineReview).toBe(false);
+  });
+
+  it('config set handles reviewConcurrency values', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set reviewConcurrency 2', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Set reviewConcurrency = 2', 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.reviewConcurrency).toBe(2);
+  });
+
+  it('config set rejects reviewConcurrency above the safe maximum', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set reviewConcurrency 9', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('at most 8'), 'error');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    expect(fs.existsSync(configPath)).toBe(false);
   });
 
   it('config set handles maxReviewPasses values', async () => {
@@ -820,6 +1080,9 @@ describe('autoReviewExtension', () => {
     const lastCall = ctx.ui.notify.mock.calls[ctx.ui.notify.mock.calls.length - 1];
     expect(lastCall[0]).toContain('Auto review configuration');
     expect(lastCall[0]).toContain('autoFix: false');
+    expect(lastCall[0]).toContain('reviewConcurrency: 4');
+    expect(lastCall[0]).toContain('includeBaselineReview: true');
+    expect(lastCall[0]).toContain('fixerAgent: worker');
     expect(lastCall[0]).toContain('autoFixSuggestions: false');
     expect(lastCall[0]).toContain('maxReviewPasses: unlimited');
   });

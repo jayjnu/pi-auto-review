@@ -14,17 +14,10 @@ export interface ReviewDecisionInput {
 }
 
 export interface ReviewPromptInput {
-  changedFiles: string[];
   status: string;
   beforeHead?: string;
   afterHead?: string;
-  reviewerAgent: string;
-  reviewerSkills: string[];
-  reviewerTaskExtra?: string;
-  autoFix: boolean;
-  autoFixSuggestions: boolean;
-  reviewPass?: number;
-  maxReviewPasses?: number | null;
+  changedFiles?: string[];
 }
 
 export const AUTO_REVIEW_SKILL_COMMAND = '/skill:auto-review';
@@ -56,6 +49,16 @@ export function isFileMutationToolResult(toolName: string, isError: boolean | un
   return toolName === 'edit' || toolName === 'write';
 }
 
+function isSubagentTaskForAgent(value: unknown, agentName: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const task = value as { agent?: unknown; tasks?: unknown; chain?: unknown; parallel?: unknown };
+  if (task.agent === agentName) return true;
+  if (Array.isArray(task.tasks)) return task.tasks.some((t) => isSubagentTaskForAgent(t, agentName));
+  if (Array.isArray(task.parallel)) return task.parallel.some((t) => isSubagentTaskForAgent(t, agentName));
+  if (Array.isArray(task.chain)) return task.chain.some((t) => isSubagentTaskForAgent(t, agentName));
+  return false;
+}
+
 function isReviewerTask(value: unknown, reviewerAgent = 'reviewer'): boolean {
   if (!value || typeof value !== 'object') return false;
   const task = value as { agent?: unknown; tasks?: unknown };
@@ -69,6 +72,11 @@ export function isReviewerSubagentInput(input: Record<string, unknown> | undefin
   if (input.agent === reviewerAgent) return true;
   if (Array.isArray(input.tasks)) return input.tasks.length > 0 && input.tasks.every((t) => isReviewerTask(t, reviewerAgent));
   return false;
+}
+
+export function isAutoReviewFixerSubagentInput(input: Record<string, unknown> | undefined, fixerAgent = 'worker'): boolean {
+  if (!input || !fixerAgent) return false;
+  return isSubagentTaskForAgent(input, fixerAgent);
 }
 
 export function isLikelyMutatingBashCommand(command: string): boolean {
@@ -247,6 +255,22 @@ export function shouldRunReview(input: ReviewDecisionInput): boolean {
   return statusChanged || headChanged;
 }
 
-export function buildReviewPrompt(_input: ReviewPromptInput): string {
-  return AUTO_REVIEW_SKILL_COMMAND;
+export function buildReviewPrompt(input?: ReviewPromptInput): string {
+  const beforeHead = input?.beforeHead?.trim() ?? '';
+  const afterHead = input?.afterHead?.trim() ?? '';
+  const isCommittedCleanWorktree = beforeHead.length > 0
+    && afterHead.length > 0
+    && beforeHead !== afterHead
+    && (input?.status ?? '').trim().length === 0;
+
+  if (!isCommittedCleanWorktree) return AUTO_REVIEW_SKILL_COMMAND;
+
+  const changedFiles = Array.from(new Set(input?.changedFiles ?? []))
+    .filter((file) => file.length > 0)
+    .sort();
+  const filesLine = changedFiles.length > 0
+    ? `\nChanged files: ${changedFiles.map((file) => JSON.stringify(file)).join(', ')}`
+    : '';
+
+  return `${AUTO_REVIEW_SKILL_COMMAND}\n\nAuto-review context:\nCommitted clean-worktree range: ${beforeHead}..${afterHead}${filesLine}`;
 }

@@ -1,6 +1,6 @@
 {
   "name": "@jayjnu/pi-auto-review",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Pi package that automatically queues a read-only code review after agent code changes.",
   "type": "module",
   "repository": {
@@ -8,7 +8,12 @@
     "url": "https://github.com/jayjnu/pi-auto-review"
   },
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "code-review", "agent"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "code-review",
+    "agent"
+  ],
   "files": [
     "extensions/auto-review/*.ts",
     "!extensions/auto-review/*.test.ts",
@@ -28,13 +33,20 @@
       "./node_modules/pi-subagents/src/extension/index.ts",
       "./extensions/auto-review/index.ts"
     ],
-    "skills": ["./skills", "./node_modules/pi-subagents/skills"],
-    "prompts": ["./node_modules/pi-subagents/prompts"]
+    "skills": [
+      "./skills",
+      "./node_modules/pi-subagents/skills"
+    ],
+    "prompts": [
+      "./node_modules/pi-subagents/prompts"
+    ]
   },
   "dependencies": {
     "pi-subagents": "^0.25.0"
   },
-  "bundledDependencies": ["pi-subagents"],
+  "bundledDependencies": [
+    "pi-subagents"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

@@ -8,6 +8,11 @@ export interface AutoReviewConfig {
   reviewerAgent?: string;
   reviewerSkills?: string[];
   reviewerTaskExtra?: string;
+  reviewConcurrency?: number;
+  includeBaselineReview?: boolean;
+  fixerAgent?: string;
+  fixerSkills?: string[];
+  fixerTaskExtra?: string;
   autoFix?: boolean;
   autoFixSuggestions?: boolean;
   blockInputDuringReview?: boolean;
@@ -15,11 +20,18 @@ export interface AutoReviewConfig {
   maxReviewPasses?: number | null;
 }
 
+export const MAX_REVIEW_CONCURRENCY = 8;
+
 const DEFAULT_CONFIG: Required<AutoReviewConfig> = {
   enabled: true,
   reviewerAgent: 'reviewer',
   reviewerSkills: [],
   reviewerTaskExtra: '',
+  reviewConcurrency: 4,
+  includeBaselineReview: true,
+  fixerAgent: 'worker',
+  fixerSkills: [],
+  fixerTaskExtra: '',
   autoFix: true,
   autoFixSuggestions: false,
   blockInputDuringReview: true,
@@ -36,16 +48,30 @@ function loadConfigFile(filePath: string): unknown {
   }
 }
 
+function normalizeSkillArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const trimmed = value.map((skill) => typeof skill === 'string' ? skill.trim() : undefined);
+  if (trimmed.every((skill): skill is string => typeof skill === 'string' && skill.length > 0)) return trimmed;
+  return undefined;
+}
+
 function normalizeConfig(value: unknown): AutoReviewConfig {
   if (!value || typeof value !== 'object') return {};
   const obj = value as Record<string, unknown>;
   const result: AutoReviewConfig = {};
   if ('enabled' in obj && typeof obj.enabled === 'boolean') result.enabled = obj.enabled;
   if ('reviewerAgent' in obj && typeof obj.reviewerAgent === 'string' && obj.reviewerAgent.trim().length > 0) result.reviewerAgent = obj.reviewerAgent.trim();
-  if ('reviewerSkills' in obj && Array.isArray(obj.reviewerSkills) && obj.reviewerSkills.every((s) => typeof s === 'string')) {
-    result.reviewerSkills = obj.reviewerSkills;
-  }
+  const reviewerSkills = normalizeSkillArray(obj.reviewerSkills);
+  if ('reviewerSkills' in obj && reviewerSkills) result.reviewerSkills = reviewerSkills;
   if ('reviewerTaskExtra' in obj && typeof obj.reviewerTaskExtra === 'string') result.reviewerTaskExtra = obj.reviewerTaskExtra;
+  if ('reviewConcurrency' in obj && typeof obj.reviewConcurrency === 'number' && Number.isInteger(obj.reviewConcurrency) && obj.reviewConcurrency > 0) {
+    result.reviewConcurrency = Math.min(obj.reviewConcurrency, MAX_REVIEW_CONCURRENCY);
+  }
+  if ('includeBaselineReview' in obj && typeof obj.includeBaselineReview === 'boolean') result.includeBaselineReview = obj.includeBaselineReview;
+  if ('fixerAgent' in obj && typeof obj.fixerAgent === 'string' && obj.fixerAgent.trim().length > 0) result.fixerAgent = obj.fixerAgent.trim();
+  const fixerSkills = normalizeSkillArray(obj.fixerSkills);
+  if ('fixerSkills' in obj && fixerSkills) result.fixerSkills = fixerSkills;
+  if ('fixerTaskExtra' in obj && typeof obj.fixerTaskExtra === 'string') result.fixerTaskExtra = obj.fixerTaskExtra;
   if ('autoFix' in obj && typeof obj.autoFix === 'boolean') result.autoFix = obj.autoFix;
   if ('autoFixSuggestions' in obj && typeof obj.autoFixSuggestions === 'boolean') result.autoFixSuggestions = obj.autoFixSuggestions;
   if ('blockInputDuringReview' in obj && typeof obj.blockInputDuringReview === 'boolean') result.blockInputDuringReview = obj.blockInputDuringReview;
@@ -66,6 +92,11 @@ const CONFIG_KEYS: ConfigKey[] = [
   'reviewerAgent',
   'reviewerSkills',
   'reviewerTaskExtra',
+  'reviewConcurrency',
+  'includeBaselineReview',
+  'fixerAgent',
+  'fixerSkills',
+  'fixerTaskExtra',
   'autoFix',
   'autoFixSuggestions',
   'blockInputDuringReview',
@@ -114,6 +145,11 @@ export function initProjectConfig(cwd: string): void {
         reviewerAgent: 'reviewer',
         reviewerSkills: [],
         reviewerTaskExtra: '',
+        reviewConcurrency: 4,
+        includeBaselineReview: true,
+        fixerAgent: 'worker',
+        fixerSkills: [],
+        fixerTaskExtra: '',
         autoFix: true,
         autoFixSuggestions: false,
         blockInputDuringReview: true,
@@ -127,16 +163,24 @@ export function initProjectConfig(cwd: string): void {
   );
 }
 
+function isJsonLikeSkillArrayInput(value: string): boolean {
+  return /^[\[{\"]/.test(value) || ['true', 'false', 'null'].includes(value);
+}
+
 export function parseConfigValue(key: ConfigKey, raw: string): unknown {
   const trimmed = raw.trim();
-  if (key === 'enabled' || key === 'autoFix' || key === 'autoFixSuggestions' || key === 'blockInputDuringReview') {
+  if (key === 'enabled' || key === 'includeBaselineReview' || key === 'autoFix' || key === 'autoFixSuggestions' || key === 'blockInputDuringReview') {
     if (trimmed === 'true') return true;
     if (trimmed === 'false') return false;
     throw new Error(`Expected boolean (true/false) for ${key}`);
   }
-  if (key === 'reviewStartWatchdogMs') {
+  if (key === 'reviewStartWatchdogMs' || key === 'reviewConcurrency') {
     const num = Number(trimmed);
     if (!Number.isFinite(num) || num <= 0) throw new Error(`Expected positive number for ${key}`);
+    if (key === 'reviewConcurrency') {
+      if (!Number.isInteger(num)) throw new Error(`Expected positive integer for ${key}`);
+      if (num > MAX_REVIEW_CONCURRENCY) throw new Error(`Expected ${key} to be at most ${MAX_REVIEW_CONCURRENCY}`);
+    }
     return num;
   }
   if (key === 'maxReviewPasses') {
@@ -145,18 +189,28 @@ export function parseConfigValue(key: ConfigKey, raw: string): unknown {
     if (!Number.isInteger(num) || num <= 0) throw new Error(`Expected positive integer or unlimited/null/none for ${key}`);
     return num;
   }
-  if (key === 'reviewerSkills') {
+  if (key === 'reviewerSkills' || key === 'fixerSkills') {
     if (trimmed === '[]') return [];
+    const skillArrayError = `Expected JSON array or space-separated list for ${key}`;
     try {
       const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed) && parsed.every((s) => typeof s === 'string')) return parsed;
-    } catch { /* fall through */ }
+      if (Array.isArray(parsed)) {
+        const skills = normalizeSkillArray(parsed);
+        if (skills) return skills;
+        throw new Error(`Expected JSON array of non-empty strings for ${key}`);
+      }
+      if (isJsonLikeSkillArrayInput(trimmed)) throw new Error(skillArrayError);
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('non-empty strings')) throw err;
+      if (isJsonLikeSkillArrayInput(trimmed)) throw new Error(skillArrayError);
+      // fall through to shorthand for non-JSON input
+    }
     // Accept space-separated list as shorthand
     const parts = trimmed.split(/\s+/).filter(Boolean);
     if (parts.length > 0) return parts;
-    throw new Error(`Expected JSON array or space-separated list for ${key}`);
+    throw new Error(skillArrayError);
   }
-  // string fields: reviewerAgent, reviewerTaskExtra
+  // string fields: reviewerAgent, reviewerTaskExtra, fixerAgent, fixerTaskExtra
   return trimmed;
 }
 
