@@ -22,6 +22,9 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('[auto-review:validation]');
     expect(skill).toContain('[auto-review:maintainability]');
     expect(skill).toContain('[auto-review:skill:<skill-name>]');
+    expect(skill).toContain('[auto-review:profile:<profile-id>]');
+    expect(skill).toContain('model: "openai-codex/gpt-5.5"');
+    expect(skill).toContain('split it into sequential batches of at most 8 tasks');
     expect(skill).toContain('Start your response with: Reviewer: [auto-review:correctness]');
     expect(skill).toContain('Committed clean-worktree range: <before>..<after>');
     expect(skill).toContain('Review target: committed range <before>..<after>');
@@ -37,6 +40,11 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('require booleans to be actual booleans');
     expect(skill).toContain('require `reviewConcurrency` to be a positive integer capped at `8` and defaulting to `4`');
     expect(skill).toContain('require `reviewerSkills`/`fixerSkills` to be string arrays in JSON config');
+    expect(skill).toContain('require `reviewerProfiles` to be a JSON array of objects');
+    expect(skill).toContain('Merge `reviewerProfiles` by `id`');
+    expect(skill).toContain('Do not treat `null` or empty strings as an unset mechanism');
+    expect(skill).toContain('replaces the project-level `reviewerProfiles` array');
+    expect(skill).toContain('does not append to or patch the existing project list');
     expect(skill).toContain('space-separated input because it writes an array');
   });
 });

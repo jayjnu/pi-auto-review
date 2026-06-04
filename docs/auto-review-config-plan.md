@@ -22,6 +22,16 @@ export interface AutoReviewConfig {
   reviewerAgent?: string;
   reviewerSkills?: string[];
   reviewerTaskExtra?: string;
+  reviewerProfiles?: Array<{
+    id: string;
+    agent?: string;
+    model?: string;
+    skills?: string[];
+    task?: string;
+    taskExtra?: string;
+    label?: string;
+    enabled?: boolean;
+  }>;
   reviewConcurrency?: number;
   includeBaselineReview?: boolean;
   fixerAgent?: string;
@@ -43,6 +53,7 @@ Defaults:
   reviewerAgent: 'reviewer',
   reviewerSkills: [],
   reviewerTaskExtra: '',
+  reviewerProfiles: [],
   reviewConcurrency: 4,
   includeBaselineReview: true,
   fixerAgent: 'worker',
@@ -66,7 +77,7 @@ defaults
 < <cwd>/.pi/extensions/auto-review/config.json
 ```
 
-Project config overrides global config.
+Project config overrides global config. `reviewerProfiles` normalization and merge behavior is implemented in `extensions/auto-review/reviewer-profiles.ts`; this is the executable source of truth. In summary, profiles are merged by `id`, so project config can override fields, add fields, inherit omitted fields, or disable global profiles with `enabled: false`. A project override may omit `task` to inherit a global profile task by id. A new enabled profile needs a non-empty `task` to create a standalone reviewer task. There is no supported null/empty-string clearing mechanism for inherited optional profile fields; `null` or `""` cannot currently unset inherited `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`. The `/auto-review config set reviewerProfiles [...]` command replaces the project-level `reviewerProfiles` array in that file; it is not an append/update operation for the project list. Effective config still merges global and project profiles by `id` after the project array is replaced.
 
 Behavior:
 
@@ -91,9 +102,10 @@ The skill now instructs the main agent to:
 1. Decide whether a review target exists.
 2. Build a flat parallel reviewer fanout:
    - three default baseline reviewers when `includeBaselineReview` is true: correctness/regressions, tests/validation, and simplicity/maintainability;
+   - one isolated additional reviewer task per enabled `reviewerProfiles` entry with a non-empty effective `task`, with per-profile `agent`, `model`, `skills`, role `task`, and `taskExtra`; project overrides may omit fields to inherit them by id, but cannot unset inherited optional fields with `null` or empty strings;
    - one isolated additional reviewer task per `reviewerSkills` entry;
    - `reviewerTaskExtra` appended to every reviewer task;
-   - `reviewConcurrency` passed to `subagent({ tasks })`.
+   - `reviewConcurrency` passed to `subagent({ tasks })`, with reviewer fanout split into sequential batches of at most 8 tasks when needed.
 3. Keep reviewers read-only and non-nested.
 4. Synthesize findings in the main session.
 5. If `autoFix` permits accepted fixes, dispatch exactly one `fixerAgent` subagent as the only writer.
@@ -142,6 +154,7 @@ Config-related tests cover:
 - Prompt generation is the minimal `/skill:auto-review` command.
 - Config is loaded before dispatch while the generated prompt remains `/skill:auto-review`.
 - Reviewer/fixer skill arrays parse from shorthand.
+- Reviewer profile JSON arrays normalize and merge by `id` across global/project config.
 - `reviewConcurrency`, `includeBaselineReview`, and `fixerAgent` defaults/config commands.
 - Completed configured fixer subagent results, including errored or partial runs, are treated as mutation sources for follow-up review passes when git state/content changed.
 

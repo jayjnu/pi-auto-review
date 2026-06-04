@@ -901,6 +901,7 @@ describe('autoReviewExtension', () => {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.enabled).toBe(true);
     expect(parsed.reviewerAgent).toBe('reviewer');
+    expect(parsed.reviewerProfiles).toEqual([]);
     expect(parsed.reviewConcurrency).toBe(4);
     expect(parsed.includeBaselineReview).toBe(true);
     expect(parsed.fixerAgent).toBe('worker');
@@ -954,6 +955,22 @@ describe('autoReviewExtension', () => {
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.reviewerSkills).toEqual(['effect-ts-re', 'reviewer']);
     expect(parsed.fixerSkills).toEqual(['effect-typescript']);
+  });
+
+  it('config set handles reviewerProfiles JSON arrays', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('config set reviewerProfiles [{"id":"frontend-perf","agent":"reviewer","model":"openai/gpt","skills":["frontend-review"],"task":"Check performance."}]', ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining('Set reviewerProfiles'), 'info');
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect(parsed.reviewerProfiles).toEqual([{ id: 'frontend-perf', agent: 'reviewer', model: 'openai/gpt', skills: ['frontend-review'], task: 'Check performance.' }]);
   });
 
   it('config set handles autoFixSuggestions and includeBaselineReview boolean values', async () => {
@@ -1071,7 +1088,7 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     ctx.cwd = dir;
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false }));
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false, includeBaselineReview: true }));
 
     autoReviewExtension(pi as never);
     await pi.handlers.session_start[0]({}, ctx);

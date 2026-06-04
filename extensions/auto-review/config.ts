@@ -1,13 +1,16 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { mergeReviewerProfiles, normalizeReviewerProfiles, REVIEWER_PROFILES_PARSE_ERROR, type ReviewerProfileConfig } from './reviewer-profiles.ts';
 
-// Configuration schema for pi-auto-review
+export type { ReviewerProfileConfig } from './reviewer-profiles.ts';
+
 export interface AutoReviewConfig {
   enabled?: boolean;
   reviewerAgent?: string;
   reviewerSkills?: string[];
   reviewerTaskExtra?: string;
+  reviewerProfiles?: ReviewerProfileConfig[];
   reviewConcurrency?: number;
   includeBaselineReview?: boolean;
   fixerAgent?: string;
@@ -27,6 +30,7 @@ const DEFAULT_CONFIG: Required<AutoReviewConfig> = {
   reviewerAgent: 'reviewer',
   reviewerSkills: [],
   reviewerTaskExtra: '',
+  reviewerProfiles: [],
   reviewConcurrency: 4,
   includeBaselineReview: true,
   fixerAgent: 'worker',
@@ -64,6 +68,8 @@ function normalizeConfig(value: unknown): AutoReviewConfig {
   const reviewerSkills = normalizeSkillArray(obj.reviewerSkills);
   if ('reviewerSkills' in obj && reviewerSkills) result.reviewerSkills = reviewerSkills;
   if ('reviewerTaskExtra' in obj && typeof obj.reviewerTaskExtra === 'string') result.reviewerTaskExtra = obj.reviewerTaskExtra;
+  const reviewerProfiles = normalizeReviewerProfiles(obj.reviewerProfiles);
+  if ('reviewerProfiles' in obj && reviewerProfiles) result.reviewerProfiles = reviewerProfiles;
   if ('reviewConcurrency' in obj && typeof obj.reviewConcurrency === 'number' && Number.isInteger(obj.reviewConcurrency) && obj.reviewConcurrency > 0) {
     result.reviewConcurrency = Math.min(obj.reviewConcurrency, MAX_REVIEW_CONCURRENCY);
   }
@@ -92,6 +98,7 @@ const CONFIG_KEYS: ConfigKey[] = [
   'reviewerAgent',
   'reviewerSkills',
   'reviewerTaskExtra',
+  'reviewerProfiles',
   'reviewConcurrency',
   'includeBaselineReview',
   'fixerAgent',
@@ -139,26 +146,7 @@ export function initProjectConfig(cwd: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(
     filePath,
-    JSON.stringify(
-      {
-        enabled: true,
-        reviewerAgent: 'reviewer',
-        reviewerSkills: [],
-        reviewerTaskExtra: '',
-        reviewConcurrency: 4,
-        includeBaselineReview: true,
-        fixerAgent: 'worker',
-        fixerSkills: [],
-        fixerTaskExtra: '',
-        autoFix: true,
-        autoFixSuggestions: false,
-        blockInputDuringReview: true,
-        reviewStartWatchdogMs: 30_000,
-        maxReviewPasses: null,
-      },
-      null,
-      2,
-    ) + '\n',
+    JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n',
     'utf-8',
   );
 }
@@ -188,6 +176,17 @@ export function parseConfigValue(key: ConfigKey, raw: string): unknown {
     const num = Number(trimmed);
     if (!Number.isInteger(num) || num <= 0) throw new Error(`Expected positive integer or unlimited/null/none for ${key}`);
     return num;
+  }
+  if (key === 'reviewerProfiles') {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const profiles = normalizeReviewerProfiles(parsed);
+      if (profiles) return profiles;
+      throw new Error(REVIEWER_PROFILES_PARSE_ERROR);
+    } catch (err) {
+      if (err instanceof Error && err.message === REVIEWER_PROFILES_PARSE_ERROR) throw err;
+      throw new Error(REVIEWER_PROFILES_PARSE_ERROR);
+    }
   }
   if (key === 'reviewerSkills' || key === 'fixerSkills') {
     if (trimmed === '[]') return [];
@@ -236,5 +235,10 @@ export function getMergedConfig(cwd: string, homeDir = os.homedir()): Required<A
   const projectFile = path.join(cwd, '.pi', 'extensions', 'auto-review', 'config.json');
   const globalConfig = normalizeConfig(loadConfigFile(globalFile));
   const projectConfig = normalizeConfig(loadConfigFile(projectFile));
-  return { ...DEFAULT_CONFIG, ...globalConfig, ...projectConfig };
+  return {
+    ...DEFAULT_CONFIG,
+    ...globalConfig,
+    ...projectConfig,
+    reviewerProfiles: mergeReviewerProfiles(DEFAULT_CONFIG.reviewerProfiles, globalConfig.reviewerProfiles, projectConfig.reviewerProfiles),
+  };
 }

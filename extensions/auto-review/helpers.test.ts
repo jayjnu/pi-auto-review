@@ -268,6 +268,7 @@ describe('getMergedConfig', () => {
     expect(config.reviewerAgent).toBe('reviewer');
     expect(config.reviewerSkills).toEqual([]);
     expect(config.reviewerTaskExtra).toBe('');
+    expect(config.reviewerProfiles).toEqual([]);
     expect(config.reviewConcurrency).toBe(4);
     expect(config.includeBaselineReview).toBe(true);
     expect(config.fixerAgent).toBe('worker');
@@ -291,6 +292,58 @@ describe('getMergedConfig', () => {
     const config = getMergedConfig(project, dir);
     expect(config.autoFix).toBe(true);
     expect(config.reviewerAgent).toBe('project-reviewer');
+  });
+
+  it('merges reviewerProfiles by id so project config can override global reviewers', () => {
+    const dir = createTempDir();
+    const project = path.join(dir, 'project');
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'frontend-perf', agent: 'reviewer', model: 'global/model', skills: ['frontend-review'], task: 'Check rendering performance.' },
+        { id: 'security', agent: 'security-reviewer', task: 'Check security issues.' },
+      ],
+    }));
+    fs.writeFileSync(path.join(project, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'frontend-perf', model: 'project/model', taskExtra: 'Use project design-system constraints.' },
+        { id: 'security', enabled: false },
+        { id: 'effect', skills: ['effect-ts-reviewer'], task: 'Check Effect.ts usage.' },
+      ],
+    }));
+
+    const config = getMergedConfig(project, dir);
+    expect(config.reviewerProfiles).toEqual([
+      { id: 'frontend-perf', agent: 'reviewer', model: 'project/model', skills: ['frontend-review'], task: 'Check rendering performance.', taskExtra: 'Use project design-system constraints.' },
+      { id: 'security', agent: 'security-reviewer', task: 'Check security issues.', enabled: false },
+      { id: 'effect', skills: ['effect-ts-reviewer'], task: 'Check Effect.ts usage.' },
+    ]);
+  });
+
+  it('rejects empty project reviewerProfiles taskExtra so lower-priority global profiles remain effective', () => {
+    const dir = createTempDir();
+    const project = path.join(dir, 'project');
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'empty-extra', task: 'Check empty extra inheritance.', taskExtra: 'Global empty extra.' },
+        { id: 'whitespace-extra', task: 'Check whitespace extra inheritance.', taskExtra: 'Global whitespace extra.' },
+      ],
+    }));
+    fs.writeFileSync(path.join(project, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'empty-extra', taskExtra: '' },
+        { id: 'whitespace-extra', taskExtra: '   ' },
+      ],
+    }));
+
+    const config = getMergedConfig(project, dir);
+    expect(config.reviewerProfiles).toEqual([
+      { id: 'empty-extra', task: 'Check empty extra inheritance.', taskExtra: 'Global empty extra.' },
+      { id: 'whitespace-extra', task: 'Check whitespace extra inheritance.', taskExtra: 'Global whitespace extra.' },
+    ]);
   });
 
   it('ignores invalid JSON with fallback to defaults', () => {
@@ -320,6 +373,61 @@ describe('getMergedConfig', () => {
     const config = getMergedConfig(dir, dir);
     expect(config.reviewerSkills).toEqual(['effect-ts-re', 'reviewer']);
     expect(config.fixerSkills).toEqual(['fixer-skill']);
+  });
+
+  it('trims and keeps valid reviewerProfiles from config files', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [{
+        id: ' frontend ',
+        agent: ' reviewer ',
+        model: ' openai/gpt ',
+        skills: [' frontend-review '],
+        task: ' Review frontend changes. ',
+        taskExtra: ' Use project frontend constraints. ',
+        label: ' Frontend ',
+        enabled: true,
+      }],
+    }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewerProfiles).toEqual([{ id: 'frontend', agent: 'reviewer', model: 'openai/gpt', skills: ['frontend-review'], task: 'Review frontend changes.', taskExtra: 'Use project frontend constraints.', label: 'Frontend', enabled: true }]);
+  });
+
+  it('ignores invalid reviewerProfiles arrays', () => {
+    const dir = createTempDir();
+    fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerProfiles: [{ id: 'valid', skills: ['ok'] }, { id: '', task: 'bad' }] }));
+
+    const config = getMergedConfig(dir, dir);
+    expect(config.reviewerProfiles).toEqual([]);
+  });
+
+  it('rejects reviewerProfiles arrays with invalid optional string fields or enabled values', () => {
+    const invalidProfiles = [
+      { id: 'numeric-agent', agent: 123 },
+      { id: 'empty-agent', agent: '' },
+      { id: 'numeric-model', model: 123 },
+      { id: 'empty-model', model: '   ' },
+      { id: 'numeric-label', label: 123 },
+      { id: 'empty-label', label: '' },
+      { id: 'numeric-task', task: 123 },
+      { id: 'empty-task', task: '   ' },
+      { id: 'numeric-task-extra', taskExtra: 123 },
+      { id: 'empty-task-extra', taskExtra: '' },
+      { id: 'string-enabled', enabled: 'true' },
+      { id: 'numeric-enabled', enabled: 1 },
+    ];
+
+    for (const invalidProfile of invalidProfiles) {
+      const dir = createTempDir();
+      fs.mkdirSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerProfiles: [{ id: 'valid', task: 'Check valid profile.' }, invalidProfile] }));
+
+      const config = getMergedConfig(dir, dir);
+      expect(config.reviewerProfiles, `invalid profile should reject array: ${JSON.stringify(invalidProfile)}`).toEqual([]);
+    }
   });
 
   it('filters non-array reviewerSkills/fixerSkills, non-string items, and empty strings', () => {
@@ -384,6 +492,40 @@ describe('isAutoReviewFixerSubagentInput', () => {
     expect(isAutoReviewFixerSubagentInput({ agent: 'custom-fixer', task: 'fix' }, 'worker')).toBe(false);
     expect(isAutoReviewFixerSubagentInput({ agent: 'custom-fixer', task: 'fix' }, 'custom-fixer')).toBe(true);
     expect(isAutoReviewFixerSubagentInput(undefined)).toBe(false);
+  });
+});
+
+describe('parseConfigValue reviewerProfiles', () => {
+  it('parses JSON reviewer profile arrays', () => {
+    expect(parseConfigValue('reviewerProfiles', '[{"id":"frontend-perf","agent":"reviewer","model":"openai/gpt","skills":["frontend-review"],"task":"Check perf"}]')).toEqual([
+      { id: 'frontend-perf', agent: 'reviewer', model: 'openai/gpt', skills: ['frontend-review'], task: 'Check perf' },
+    ]);
+  });
+
+  it('rejects non-array or invalid reviewerProfiles values', () => {
+    expect(() => parseConfigValue('reviewerProfiles', '{"id":"frontend"}')).toThrow('Expected JSON array of reviewer profile objects');
+    expect(() => parseConfigValue('reviewerProfiles', '[{"id":"frontend","skills":[""]}]')).toThrow('Expected JSON array of reviewer profile objects');
+  });
+
+  it('rejects invalid optional reviewerProfiles fields from command input', () => {
+    const invalidProfiles = [
+      { id: 'numeric-model', model: 123 },
+      { id: 'empty-model', model: '' },
+      { id: 'numeric-label', label: 123 },
+      { id: 'empty-label', label: '   ' },
+      { id: 'numeric-task', task: 123 },
+      { id: 'empty-task', task: '' },
+      { id: 'numeric-task-extra', taskExtra: 123 },
+      { id: 'empty-task-extra', taskExtra: '   ' },
+      { id: 'string-enabled', enabled: 'true' },
+    ];
+
+    for (const invalidProfile of invalidProfiles) {
+      expect(
+        () => parseConfigValue('reviewerProfiles', JSON.stringify([invalidProfile])),
+        `invalid profile should be rejected: ${JSON.stringify(invalidProfile)}`,
+      ).toThrow('optional agent/model/label/task/taskExtra must be non-empty strings');
+    }
   });
 });
 

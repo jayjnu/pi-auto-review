@@ -26,7 +26,7 @@ pi -e /path/to/pi-auto-review
 
 The package bundles `pi-subagents` and an `auto-review` skill. After Pi becomes idle, it queues a short `/skill:auto-review` main-agent orchestration turn. For normal dirty-worktree reviews this prompt stays minimal; for clean-worktree committed changes it appends only the compact `before..after` commit range and changed-file names so the skill can inspect the committed diff.
 
-That skill tells the main agent to first decide whether the current context contains a meaningful review target, then orchestrate a flat parallel reviewer fanout. Three baseline reviewers are included by default (correctness/regressions, tests/validation, and simplicity/maintainability), and each configured `reviewerSkills` entry becomes its own isolated additional reviewer task. The main agent synthesizes those read-only reviewer results. When auto-fix is enabled and Critical or Warning findings are accepted, the main agent dispatches exactly one configured fixer subagent as the single writer. That means:
+That skill tells the main agent to first decide whether the current context contains a meaningful review target, then orchestrate a flat parallel reviewer fanout. Three baseline reviewers are included by default (correctness/regressions, tests/validation, and simplicity/maintainability), each configured `reviewerProfiles` entry becomes an isolated role/model-specific reviewer task, and each configured `reviewerSkills` entry becomes its own isolated additional reviewer task. The main agent synthesizes those read-only reviewer results. When auto-fix is enabled and Critical or Warning findings are accepted, the main agent dispatches exactly one configured fixer subagent as the single writer. That means:
 
 - review context is isolated in child Pi sessions via `pi-subagents`;
 - skill-specific review perspectives can run in parallel without nested fanout;
@@ -39,7 +39,7 @@ The extension dispatches the `/skill:auto-review` skill command, with compact co
 
 The package assumes Pi skill commands are enabled. Pi defaults `enableSkillCommands` to `true`; if your effective settings disable it, `pi-auto-review` shows a session-start warning asking you to set `"enableSkillCommands": true` in `~/.pi/agent/settings.json` or `.pi/settings.json`.
 
-The package does not define a custom model setting. Configure reviewer model behavior with Pi's official `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` settings.
+The package inherits Pi's default model unless a subagent or reviewer profile overrides it. Configure global defaults with Pi's official `defaultProvider`, `defaultModel`, and `defaultThinkingLevel` settings, or set `reviewerProfiles[].model` for a specific auto-review reviewer role.
 
 ## Disable
 
@@ -85,7 +85,7 @@ Project config path:
 .pi/extensions/auto-review/config.json
 ```
 
-Project config overrides global config. You can create and edit the project config through Pi commands:
+Project config overrides global config. `reviewerProfiles` normalization and merge behavior is implemented in `extensions/auto-review/reviewer-profiles.ts`; the docs below summarize that executable contract. Profiles are merged by `id` so project config can override fields, add fields, inherit omitted fields, or disable global reviewer profiles with `enabled: false`. Because profiles merge by `id`, a project override may omit `task` to inherit the global profile's task text. A new enabled profile needs a non-empty `task` to create a standalone reviewer task. There is no supported null/empty-string clearing mechanism for inherited optional profile fields; do not expect `null` or `""` to unset inherited `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`. Note that `/auto-review config set reviewerProfiles [...]` replaces the project-level `reviewerProfiles` array in `.pi/extensions/auto-review/config.json`; it is not an append/update command for the project list. Effective config still merges global and project profiles by `id`. You can create and edit the project config through Pi commands:
 
 ```text
 /auto-review config init
@@ -103,6 +103,15 @@ Example config file:
   "reviewerAgent": "reviewer",
   "reviewerSkills": ["frontend-review", "effect-ts-reviewer"],
   "reviewerTaskExtra": "",
+  "reviewerProfiles": [
+    {
+      "id": "frontend-performance",
+      "agent": "reviewer",
+      "model": "openai-codex/gpt-5.5",
+      "skills": ["frontend-review"],
+      "task": "Focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects."
+    }
+  ],
   "reviewConcurrency": 4,
   "includeBaselineReview": true,
   "fixerAgent": "worker",
@@ -120,7 +129,8 @@ Example config file:
 - `reviewerAgent` — the subagent name used for review (default: `reviewer`).
 - `reviewerSkills` — extra review skills; each skill becomes its own flat parallel reviewer task (default: `[]`).
 - `reviewerTaskExtra` — extra instructions appended to every reviewer task (default: `""`).
-- `reviewConcurrency` — max concurrent flat reviewer tasks (default: `4`, capped at `8`).
+- `reviewerProfiles` — additional flat reviewer profiles (default: `[]`). Each enabled profile can set `id`, `agent`, `model`, `skills`, `task`, `taskExtra`, and `label`; project profiles merge by `id` and can override fields, add fields, omit fields to inherit them, or disable a global profile with `enabled: false`. A new enabled profile needs a non-empty `task` to create a standalone reviewer task. There is no supported null/empty-string clearing mechanism for inherited optional profile fields such as `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`.
+- `reviewConcurrency` — max concurrent flat reviewer tasks (default: `4`, capped at `8`). If baseline, profile, and skill reviewers produce more than 8 total tasks, the auto-review skill splits them into sequential subagent batches of at most 8 tasks.
 - `includeBaselineReview` — include the default baseline reviewer set: correctness/regressions, tests/validation, and simplicity/maintainability (default: `true`).
 - `fixerAgent` — the single writer subagent used for accepted auto-fixes (default: `worker`).
 - `fixerSkills` — extra skills injected into the fixer subagent (default: `[]`).
@@ -143,7 +153,13 @@ For skill-specific fanout, configure `reviewerSkills`:
 /auto-review config set reviewerSkills frontend-review effect-ts-reviewer
 ```
 
-This runs a flat parallel review pass with the three default baseline reviewers plus one reviewer per skill. Auto-fixes are delegated to `fixerAgent` as a single writer.
+For role/model-specific fanout, configure `reviewerProfiles` with JSON. New enabled profiles need a non-empty `task`; project overrides may omit `task` when they are only changing fields such as `model`, `skills`, or `taskExtra` for a global profile with the same `id`. Project overrides cannot currently unset inherited optional fields with `null` or empty strings; use explicit replacement values where supported or disable the profile with `enabled: false`. The `config set reviewerProfiles` command writes the whole project-level profile array, so include every project profile you want to keep; a single-item command leaves the project file with only that one project profile, although effective config still merges it with global profiles by `id`:
+
+```text
+/auto-review config set reviewerProfiles [{"id":"frontend-performance","agent":"reviewer","model":"openai-codex/gpt-5.5","skills":["frontend-review"],"task":"Focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects."}]
+```
+
+This runs a flat parallel review pass with the three default baseline reviewers plus configured profile and skill reviewers. Auto-fixes are delegated to `fixerAgent` as a single writer.
 
 ## Safety
 
