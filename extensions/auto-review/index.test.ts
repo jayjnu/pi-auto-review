@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import autoReviewExtension from './index.ts';
 
 interface FakePi {
@@ -38,6 +38,8 @@ async function flushQueuedReview(): Promise<void> {
 }
 
 const tempDirs: string[] = [];
+let hadOriginalSubagentChildEnv = false;
+let originalSubagentChildEnv: string | undefined;
 
 function createTempDir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-auto-review-session-'));
@@ -45,7 +47,15 @@ function createTempDir(): string {
   return dir;
 }
 
+beforeEach(() => {
+  hadOriginalSubagentChildEnv = Object.prototype.hasOwnProperty.call(process.env, 'PI_SUBAGENT_CHILD');
+  originalSubagentChildEnv = process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_CHILD;
+});
+
 afterEach(() => {
+  if (hadOriginalSubagentChildEnv && originalSubagentChildEnv !== undefined) process.env.PI_SUBAGENT_CHILD = originalSubagentChildEnv;
+  else delete process.env.PI_SUBAGENT_CHILD;
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -72,6 +82,18 @@ function createFakePi(flagValue = false): FakePi {
 }
 
 describe('autoReviewExtension', () => {
+  it('does not register commands or lifecycle hooks in subagent children', () => {
+    process.env.PI_SUBAGENT_CHILD = '1';
+    const pi = createFakePi();
+
+    autoReviewExtension(pi as never);
+
+    expect(pi.registerFlag).not.toHaveBeenCalled();
+    expect(pi.registerCommand).not.toHaveBeenCalled();
+    expect(pi.on).not.toHaveBeenCalled();
+    expect(pi.handlers).toEqual({});
+  });
+
   it('registers disable flag, control command, and lifecycle handlers', () => {
     const pi = createFakePi();
 

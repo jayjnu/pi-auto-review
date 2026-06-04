@@ -25,7 +25,12 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('[auto-review:profile:<profile-id>]');
     expect(skill).toContain('model: "openai-codex/gpt-5.5"');
     expect(skill).toContain('split it into sequential batches of at most 8 tasks');
-    expect(skill).toContain('Start your response with: Reviewer: [auto-review:correctness]');
+    expect(skill).toContain('Expected Loaded Skills: <skill-list-or-none>');
+    expect(skill).toContain('Loaded Skills: <same-skill-list-or-none>');
+    expect(skill).toContain('Loaded Skills: none');
+    expect(skill).toContain('Loaded Skills: frontend-review');
+    expect(skill).toContain('Start your response with:');
+    expect(skill).toContain('Reviewer: [auto-review:correctness]');
     expect(skill).toContain('Committed clean-worktree range: <before>..<after>');
     expect(skill).toContain('Do **not** dispatch subagents merely because `HEAD` changed');
     expect(skill).toContain('perform a cheap read-only range inspection such as `git diff --name-only <before>..<after>`');

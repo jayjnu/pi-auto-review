@@ -5,6 +5,12 @@ import { formatConfigValue, getGlobalConfigPath, getMergedConfig, getProjectConf
 import { areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 export default function autoReviewExtension(pi: ExtensionAPI) {
+  // pi-subagents launches child agents as separate Pi processes. User/project
+  // packages may still load there, so disable this extension in subagent
+  // children to avoid a child fixer queuing another auto-review turn and
+  // recursively spawning more reviewers/fixers.
+  if (process.env.PI_SUBAGENT_CHILD === '1') return;
+
   let config: Required<AutoReviewConfig> | undefined;
   let runtimeEnabledOverride: boolean | undefined;
   let reviewQueued = false;

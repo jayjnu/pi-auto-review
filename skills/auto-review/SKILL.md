@@ -44,6 +44,7 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
      - configured skill labels: `[auto-review:skill:<skill-name>]`;
      - fallback label: `[auto-review:fallback-correctness]`.
    - Put the label at the very start of the task text and require the reviewer to start its response with `Reviewer: <same-label>`. This does not rename the subagent, but it makes task previews and returned results distinguishable.
+   - Include `Expected Loaded Skills: <skill-list-or-none>` in every reviewer task and require the reviewer response to include `Loaded Skills: <same-skill-list-or-none>` immediately after the `Reviewer:` line. Use `none` for baseline/fallback reviewers, `profile.skills` for profile reviewers when non-empty, and the single configured skill name for `reviewerSkills` tasks. This is an audit marker for whether the intended skill injection was requested.
    - When a committed clean-worktree range is present, include `Review target: committed range <before>..<after>` in every reviewer task and tell reviewers to inspect that range directly.
    - Append `reviewerTaskExtra` to every reviewer task when non-empty.
 8. Run reviewer tasks with `subagent({ tasks: [...], concurrency, context: "fresh" })`.
@@ -52,7 +53,7 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
    - For reviewer profile tasks, include the `model` field only when profile `model` is non-empty.
    - Every reviewer task must say: `Do not modify project/source files; returning findings in your response is allowed.`
    - Ask reviewers to inspect the actual current diff/changed files directly, not just prior summaries.
-   - Ask reviewers to return `Reviewer: <label>`, `Critical`, `Warnings`, `Suggestions`, and `Files Reviewed` with file/line evidence where possible.
+   - Ask reviewers to return `Reviewer: <label>`, `Loaded Skills: <skill-list-or-none>`, `Critical`, `Warnings`, `Suggestions`, and `Files Reviewed` with file/line evidence where possible.
 9. Wait for all reviewer results, then synthesize them in the main session.
    - Deduplicate overlapping findings.
    - Separate `Critical`, `Warnings`, `Suggestions`, and feedback to ignore/defer.
@@ -77,30 +78,30 @@ subagent({
   tasks: [
     {
       agent: reviewerAgent,
-      task: "[auto-review:correctness]\nStart your response with: Reviewer: [auto-review:correctness]\n\nReview the current diff for correctness, regressions, edge cases, and unintended side effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:correctness]\nStart your response with:\nReviewer: [auto-review:correctness]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for correctness, regressions, edge cases, and unintended side effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
-      task: "[auto-review:validation]\nStart your response with: Reviewer: [auto-review:validation]\n\nReview the current diff for tests, validation quality, build confidence, and missing verification. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:validation]\nStart your response with:\nReviewer: [auto-review:validation]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for tests, validation quality, build confidence, and missing verification. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
-      task: "[auto-review:maintainability]\nStart your response with: Reviewer: [auto-review:maintainability]\n\nReview the current diff for simplicity, maintainability, API clarity, naming, and code organization. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:maintainability]\nStart your response with:\nReviewer: [auto-review:maintainability]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for simplicity, maintainability, API clarity, naming, and code organization. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: "frontend-reviewer",
       model: "openai-codex/gpt-5.5",
       skill: ["frontend-review"],
-      task: "[auto-review:profile:frontend-performance]\nStart your response with: Reviewer: [auto-review:profile:frontend-performance]\n\nReview the current diff with the configured profile role: focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:profile:frontend-performance]\nStart your response with:\nReviewer: [auto-review:profile:frontend-performance]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview the current diff with the configured profile role: focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
       skill: ["frontend-review"],
-      task: "[auto-review:skill:frontend-review]\nStart your response with: Reviewer: [auto-review:skill:frontend-review]\n\nReview the current diff from the frontend-review perspective: React, UI behavior, UX, accessibility, styling, component state, and user interactions. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:skill:frontend-review]\nStart your response with:\nReviewer: [auto-review:skill:frontend-review]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview the current diff from the frontend-review perspective: React, UI behavior, UX, accessibility, styling, component state, and user interactions. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     }
   ],
@@ -137,6 +138,7 @@ When `fixerSkills` is empty, omit the `skill` field entirely; still call exactly
 
 ```markdown
 ## Skills Used
+## Reviewer Skill Audit
 ## Summary
 ## Critical
 ## Warnings
