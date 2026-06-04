@@ -115,40 +115,50 @@ export function isValidConfigKey(key: string): key is ConfigKey {
   return (CONFIG_KEYS as string[]).includes(key);
 }
 
+export function getGlobalConfigPath(homeDir = os.homedir()): string {
+  return path.join(homeDir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json');
+}
+
 export function getProjectConfigPath(cwd: string): string {
   return path.join(cwd, '.pi', 'extensions', 'auto-review', 'config.json');
+}
+
+export function readGlobalConfig(homeDir = os.homedir()): AutoReviewConfig {
+  return normalizeConfig(loadConfigFile(getGlobalConfigPath(homeDir)));
 }
 
 export function readProjectConfig(cwd: string): AutoReviewConfig {
   return normalizeConfig(loadConfigFile(getProjectConfigPath(cwd)));
 }
 
-export function writeProjectConfig(cwd: string, patch: AutoReviewConfig, opts?: { homeDir?: string }): void {
-  const filePath = getProjectConfigPath(cwd);
+function writeConfigFile(filePath: string, existing: AutoReviewConfig, patch: AutoReviewConfig): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-
-  const existing = readProjectConfig(cwd);
   const merged = { ...existing, ...patch };
-
   fs.writeFileSync(filePath, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+}
 
-  // Reload merged config into active session if requested
-  if (opts?.homeDir !== undefined) {
-    // This is a side-effect free write; the caller should call getMergedConfig to refresh.
+export function writeGlobalConfig(patch: AutoReviewConfig, homeDir = os.homedir()): void {
+  writeConfigFile(getGlobalConfigPath(homeDir), readGlobalConfig(homeDir), patch);
+}
+
+export function writeProjectConfig(cwd: string, patch: AutoReviewConfig): void {
+  writeConfigFile(getProjectConfigPath(cwd), readProjectConfig(cwd), patch);
+}
+
+function initConfigFile(filePath: string): void {
+  if (fs.existsSync(filePath)) {
+    throw new Error(`Config already exists at ${filePath}`);
   }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n', 'utf-8');
+}
+
+export function initGlobalConfig(homeDir = os.homedir()): void {
+  initConfigFile(getGlobalConfigPath(homeDir));
 }
 
 export function initProjectConfig(cwd: string): void {
-  const filePath = getProjectConfigPath(cwd);
-  if (fs.existsSync(filePath)) {
-    throw new Error(`Project config already exists at ${filePath}`);
-  }
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(
-    filePath,
-    JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n',
-    'utf-8',
-  );
+  initConfigFile(getProjectConfigPath(cwd));
 }
 
 function isJsonLikeSkillArrayInput(value: string): boolean {
@@ -231,10 +241,8 @@ export function getConfigDisplay(merged: Required<AutoReviewConfig>): string {
 }
 
 export function getMergedConfig(cwd: string, homeDir = os.homedir()): Required<AutoReviewConfig> {
-  const globalFile = path.join(homeDir, '.pi', 'agent', 'extensions', 'auto-review', 'config.json');
-  const projectFile = path.join(cwd, '.pi', 'extensions', 'auto-review', 'config.json');
-  const globalConfig = normalizeConfig(loadConfigFile(globalFile));
-  const projectConfig = normalizeConfig(loadConfigFile(projectFile));
+  const globalConfig = readGlobalConfig(homeDir);
+  const projectConfig = readProjectConfig(cwd);
   return {
     ...DEFAULT_CONFIG,
     ...globalConfig,

@@ -938,6 +938,111 @@ describe('autoReviewExtension', () => {
     expect(parsed.autoFix).toBe(false);
   });
 
+  it('config --global set writes to global config and reloads', async () => {
+    const pi = createFakePi(false);
+    const home = createTempDir();
+    const project = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = project;
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.commands['auto-review'].handler('config --global set includeBaselineReview false', ctx);
+      expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(['Set includeBaselineReview = false (global)', 'info']);
+
+      await pi.commands['auto-review'].handler('config get includeBaselineReview', ctx);
+      expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(['includeBaselineReview: false', 'info']);
+
+      await pi.commands['auto-review'].handler('config --global get includeBaselineReview', ctx);
+      expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(['includeBaselineReview: false', 'info']);
+
+      const configPath = path.join(home, '.pi', 'agent', 'extensions', 'auto-review', 'config.json');
+      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      expect(parsed.includeBaselineReview).toBe(false);
+      expect(fs.existsSync(path.join(project, '.pi', 'extensions', 'auto-review', 'config.json'))).toBe(false);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+
+  it('config --project set writes to project config and project get reads project value', async () => {
+    const pi = createFakePi(false);
+    const home = createTempDir();
+    const project = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = project;
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.commands['auto-review'].handler('config --project set includeBaselineReview false', ctx);
+      expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(['Set includeBaselineReview = false', 'info']);
+
+      await pi.commands['auto-review'].handler('config --project get includeBaselineReview', ctx);
+      expect(ctx.ui.notify.mock.calls.at(-1)).toEqual(['includeBaselineReview: false', 'info']);
+
+      const projectConfigPath = path.join(project, '.pi', 'extensions', 'auto-review', 'config.json');
+      const parsed = JSON.parse(fs.readFileSync(projectConfigPath, 'utf-8'));
+      expect(parsed.includeBaselineReview).toBe(false);
+      expect(fs.existsSync(path.join(home, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'))).toBe(false);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+
+  it('config --scope effective is invalid for mutations and does not write config', async () => {
+    const pi = createFakePi(false);
+    const home = createTempDir();
+    const project = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = project;
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.commands['auto-review'].handler('config --scope effective set autoFix false', ctx);
+
+      const lastCall = ctx.ui.notify.mock.calls.at(-1);
+      expect(lastCall?.[0]).toContain('Usage:');
+      expect(lastCall?.[1]).toBe('warning');
+      expect(fs.existsSync(path.join(project, '.pi', 'extensions', 'auto-review', 'config.json'))).toBe(false);
+      expect(fs.existsSync(path.join(home, '.pi', 'agent', 'extensions', 'auto-review', 'config.json'))).toBe(false);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+
+  it('config --global init creates the global config file', async () => {
+    const pi = createFakePi(false);
+    const home = createTempDir();
+    const ctx = createFakeContext();
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+
+    try {
+      autoReviewExtension(pi as never);
+      await pi.handlers.session_start[0]({}, ctx);
+      await pi.commands['auto-review'].handler('config --global init', ctx);
+
+      const configPath = path.join(home, '.pi', 'agent', 'extensions', 'auto-review', 'config.json');
+      expect(ctx.ui.notify).toHaveBeenCalledWith(`Created global config at ${configPath}`, 'info');
+      expect(JSON.parse(fs.readFileSync(configPath, 'utf-8')).enabled).toBe(true);
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME;
+      else process.env.HOME = oldHome;
+    }
+  });
+
   it('config set handles array values for reviewerSkills and fixerSkills', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();

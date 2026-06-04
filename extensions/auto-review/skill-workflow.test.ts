@@ -27,6 +27,11 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('split it into sequential batches of at most 8 tasks');
     expect(skill).toContain('Start your response with: Reviewer: [auto-review:correctness]');
     expect(skill).toContain('Committed clean-worktree range: <before>..<after>');
+    expect(skill).toContain('Do **not** dispatch subagents merely because `HEAD` changed');
+    expect(skill).toContain('perform a cheap read-only range inspection such as `git diff --name-only <before>..<after>`');
+    expect(skill).toContain('contains no new unreviewed source/config/dependency/docs changes beyond bookkeeping');
+    expect(skill).toContain('If confidence is not high, proceed with normal committed-range review');
+    expect(skill).toContain('이미 리뷰된 변경의 commit/release 후속 작업이라 추가 리뷰를 생략합니다');
     expect(skill).toContain('Review target: committed range <before>..<after>');
   });
 
@@ -44,7 +49,7 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('Merge `reviewerProfiles` by `id`');
     expect(skill).toContain('Do not treat `null` or empty strings as an unset mechanism');
     expect(skill).toContain('replaces the project-level `reviewerProfiles` array');
-    expect(skill).toContain('does not append to or patch the existing project list');
+    expect(skill).toContain('do not append to or patch the existing scoped list');
     expect(skill).toContain('space-separated input because it writes an array');
   });
 });

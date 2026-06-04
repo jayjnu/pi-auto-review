@@ -55,10 +55,10 @@ At runtime:
 /auto-review off
 /auto-review on
 /auto-review status
-/auto-review config
-/auto-review config get <key>
-/auto-review config set <key> <value>
-/auto-review config init
+/auto-review config [--global|--project|--scope global|--scope project]
+/auto-review config [--global|--project|--scope global|--scope project] get <key>
+/auto-review config [--global|--project|--scope global|--scope project] set <key> <value>
+/auto-review config [--global|--project|--scope global|--scope project] init
 ```
 
 ## Runtime Control
@@ -85,12 +85,15 @@ Project config path:
 .pi/extensions/auto-review/config.json
 ```
 
-Project config overrides global config. `reviewerProfiles` normalization and merge behavior is implemented in `extensions/auto-review/reviewer-profiles.ts`; the docs below summarize that executable contract. Profiles are merged by `id` so project config can override fields, add fields, inherit omitted fields, or disable global reviewer profiles with `enabled: false`. Because profiles merge by `id`, a project override may omit `task` to inherit the global profile's task text. A new enabled profile needs a non-empty `task` to create a standalone reviewer task. There is no supported null/empty-string clearing mechanism for inherited optional profile fields; do not expect `null` or `""` to unset inherited `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`. Note that `/auto-review config set reviewerProfiles [...]` replaces the project-level `reviewerProfiles` array in `.pi/extensions/auto-review/config.json`; it is not an append/update command for the project list. Effective config still merges global and project profiles by `id`. You can create and edit the project config through Pi commands:
+Project config overrides global config. Use `--global` or `--scope global` to read/write the global config file, and `--project`, `--scope project`, or no scope for `set`/`init` to read/write the project config file. Unscoped `config` display/get reads effective merged settings; explicit `--scope effective` is not supported. `reviewerProfiles` normalization and merge behavior is implemented in `extensions/auto-review/reviewer-profiles.ts`; the docs below summarize that executable contract. Profiles are merged by `id` so project config can override fields, add fields, inherit omitted fields, or disable global reviewer profiles with `enabled: false`. Because profiles merge by `id`, a project override may omit `task` to inherit the global profile's task text. A new enabled profile needs a non-empty `task` to create a standalone reviewer task. There is no supported null/empty-string clearing mechanism for inherited optional profile fields; do not expect `null` or `""` to unset inherited `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`. Note that `/auto-review config set reviewerProfiles [...]` replaces the project-level `reviewerProfiles` array in `.pi/extensions/auto-review/config.json`; `/auto-review config --global set reviewerProfiles [...]` replaces the global `reviewerProfiles` array in `~/.pi/agent/extensions/auto-review/config.json`. Neither command appends/patches the existing list. Effective config still merges global and project profiles by `id`. You can create and edit config through Pi commands:
 
 ```text
 /auto-review config init
+/auto-review config --global init
 /auto-review config
+/auto-review config --global
 /auto-review config set autoFix false
+/auto-review config --global set includeBaselineReview false
 /auto-review config set autoFixSuggestions false
 /auto-review config set maxReviewPasses 2
 /auto-review config set maxReviewPasses unlimited
@@ -153,7 +156,7 @@ For skill-specific fanout, configure `reviewerSkills`:
 /auto-review config set reviewerSkills frontend-review effect-ts-reviewer
 ```
 
-For role/model-specific fanout, configure `reviewerProfiles` with JSON. New enabled profiles need a non-empty `task`; project overrides may omit `task` when they are only changing fields such as `model`, `skills`, or `taskExtra` for a global profile with the same `id`. Project overrides cannot currently unset inherited optional fields with `null` or empty strings; use explicit replacement values where supported or disable the profile with `enabled: false`. The `config set reviewerProfiles` command writes the whole project-level profile array, so include every project profile you want to keep; a single-item command leaves the project file with only that one project profile, although effective config still merges it with global profiles by `id`:
+For role/model-specific fanout, configure `reviewerProfiles` with JSON. New enabled profiles need a non-empty `task`; project overrides may omit `task` when they are only changing fields such as `model`, `skills`, or `taskExtra` for a global profile with the same `id`. Project overrides cannot currently unset inherited optional fields with `null` or empty strings; use explicit replacement values where supported or disable the profile with `enabled: false`. The `config set reviewerProfiles` command writes the whole scoped profile array, so include every profile you want to keep in that scope; a single-item command leaves that config file with only that one profile, although effective config still merges global/project profiles by `id`:
 
 ```text
 /auto-review config set reviewerProfiles [{"id":"frontend-performance","agent":"reviewer","model":"openai-codex/gpt-5.5","skills":["frontend-review"],"task":"Focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects."}]

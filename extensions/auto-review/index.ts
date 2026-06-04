@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AutoReviewConfig, ConfigKey } from './config.ts';
-import { getMergedConfig, getProjectConfigPath, initProjectConfig, isValidConfigKey, parseConfigValue, readProjectConfig, formatConfigValue, writeProjectConfig } from './config.ts';
+import { formatConfigValue, getGlobalConfigPath, getMergedConfig, getProjectConfigPath, initGlobalConfig, initProjectConfig, isValidConfigKey, parseConfigValue, readGlobalConfig, readProjectConfig, writeGlobalConfig, writeProjectConfig } from './config.ts';
 import { areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 export default function autoReviewExtension(pi: ExtensionAPI) {
@@ -117,12 +117,34 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     default: false,
   });
 
-  function parseConfigSubcommand(raw: string): { action: 'show' } | { action: 'get'; key: ConfigKey } | { action: 'set'; key: ConfigKey; value: string } | { action: 'init' } | { action: 'help' } {
+  type ConfigReadScope = 'effective' | 'global' | 'project';
+  type ConfigWriteScope = 'global' | 'project';
+  type ConfigSubcommand =
+    | { action: 'show'; scope: ConfigReadScope }
+    | { action: 'get'; scope: ConfigReadScope; key: ConfigKey }
+    | { action: 'set'; scope: ConfigWriteScope; key: ConfigKey; value: string }
+    | { action: 'init'; scope: ConfigWriteScope }
+    | { action: 'help' };
+
+  function parseConfigScope(args: string[]): { scope: ConfigReadScope; rest: string[] } | undefined {
+    if (args[1] === '--global') return { scope: 'global', rest: [args[0]!, ...args.slice(2)] };
+    if (args[1] === '--project') return { scope: 'project', rest: [args[0]!, ...args.slice(2)] };
+    if (args[1] === '--scope') {
+      if (args[2] === 'global' || args[2] === 'project') return { scope: args[2], rest: [args[0]!, ...args.slice(3)] };
+      return undefined;
+    }
+    return { scope: 'effective', rest: args };
+  }
+
+  function parseConfigSubcommand(raw: string): ConfigSubcommand {
     const args = raw.trim().split(/\s+/).filter(Boolean);
-    if (args.length === 1 && args[0] === 'config') return { action: 'show' };
-    if (args.length === 3 && args[0] === 'config' && args[1] === 'get' && isValidConfigKey(args[2])) return { action: 'get', key: args[2] };
-    if (args.length >= 4 && args[0] === 'config' && args[1] === 'set' && isValidConfigKey(args[2])) return { action: 'set', key: args[2], value: args.slice(3).join(' ') };
-    if (args.length === 2 && args[0] === 'config' && args[1] === 'init') return { action: 'init' };
+    const scoped = parseConfigScope(args);
+    if (!scoped) return { action: 'help' };
+    const { scope, rest } = scoped;
+    if (rest.length === 1 && rest[0] === 'config') return { action: 'show', scope };
+    if (rest.length === 3 && rest[0] === 'config' && rest[1] === 'get' && isValidConfigKey(rest[2])) return { action: 'get', scope, key: rest[2] };
+    if (rest.length >= 4 && rest[0] === 'config' && rest[1] === 'set' && isValidConfigKey(rest[2])) return { action: 'set', scope: scope === 'global' ? 'global' : 'project', key: rest[2], value: rest.slice(3).join(' ') };
+    if (rest.length === 2 && rest[0] === 'config' && rest[1] === 'init') return { action: 'init', scope: scope === 'global' ? 'global' : 'project' };
     return { action: 'help' };
   }
 
@@ -138,22 +160,40 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
 
         if (sub.action === 'show') {
           const merged = getMergedConfig(ctx.cwd);
+          const globalConfig = readGlobalConfig();
           const project = readProjectConfig(ctx.cwd);
-          const lines = [
-            'Auto review configuration:',
-            `Project file: ${getProjectConfigPath(ctx.cwd)}`,
-            'Project overrides:',
-            ...Object.entries(project).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
-            'Effective settings:',
-            ...Object.entries(merged).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
-          ];
+          const lines = sub.scope === 'global'
+            ? [
+                'Auto review global configuration:',
+                `Global file: ${getGlobalConfigPath()}`,
+                'Global settings:',
+                ...Object.entries(globalConfig).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
+              ]
+            : sub.scope === 'project'
+              ? [
+                  'Auto review project configuration:',
+                  `Project file: ${getProjectConfigPath(ctx.cwd)}`,
+                  'Project overrides:',
+                  ...Object.entries(project).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
+                ]
+              : [
+                  'Auto review configuration:',
+                  `Global file: ${getGlobalConfigPath()}`,
+                  `Project file: ${getProjectConfigPath(ctx.cwd)}`,
+                  'Global settings:',
+                  ...Object.entries(globalConfig).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
+                  'Project overrides:',
+                  ...Object.entries(project).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
+                  'Effective settings:',
+                  ...Object.entries(merged).map(([k, v]) => `  ${k}: ${formatConfigValue(v)}`),
+                ];
           ctx.ui.notify(lines.join('\n'), 'info');
           return;
         }
 
         if (sub.action === 'get') {
-          const merged = getMergedConfig(ctx.cwd);
-          ctx.ui.notify(`${sub.key}: ${formatConfigValue(merged[sub.key])}`, 'info');
+          const source = sub.scope === 'global' ? readGlobalConfig() : sub.scope === 'project' ? readProjectConfig(ctx.cwd) : getMergedConfig(ctx.cwd);
+          ctx.ui.notify(`${sub.key}: ${formatConfigValue(source[sub.key])}`, 'info');
           return;
         }
 
@@ -161,10 +201,12 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
           try {
             const parsed = parseConfigValue(sub.key, sub.value);
             const patch: Partial<AutoReviewConfig> = { [sub.key]: parsed };
-            writeProjectConfig(ctx.cwd, patch as AutoReviewConfig);
+            if (sub.scope === 'global') writeGlobalConfig(patch as AutoReviewConfig);
+            else writeProjectConfig(ctx.cwd, patch as AutoReviewConfig);
             // Reload config into the active session
             config = getMergedConfig(ctx.cwd);
-            ctx.ui.notify(`Set ${sub.key} = ${formatConfigValue(parsed)}`, 'info');
+            const scopeSuffix = sub.scope === 'global' ? ' (global)' : '';
+            ctx.ui.notify(`Set ${sub.key} = ${formatConfigValue(parsed)}${scopeSuffix}`, 'info');
           } catch (err) {
             ctx.ui.notify(err instanceof Error ? err.message : String(err), 'error');
           }
@@ -173,9 +215,14 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
 
         if (sub.action === 'init') {
           try {
-            initProjectConfig(ctx.cwd);
+            if (sub.scope === 'global') {
+              initGlobalConfig();
+              ctx.ui.notify(`Created global config at ${getGlobalConfigPath()}`, 'info');
+            } else {
+              initProjectConfig(ctx.cwd);
+              ctx.ui.notify(`Created project config at ${getProjectConfigPath(ctx.cwd)}`, 'info');
+            }
             config = getMergedConfig(ctx.cwd);
-            ctx.ui.notify(`Created project config at ${getProjectConfigPath(ctx.cwd)}`, 'info');
           } catch (err) {
             ctx.ui.notify(err instanceof Error ? err.message : String(err), 'error');
           }
@@ -183,7 +230,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
         }
 
         ctx.ui.notify(
-          'Usage:\n  /auto-review config\n  /auto-review config get <key>\n  /auto-review config set <key> <value>\n  /auto-review config init',
+          'Usage:\n  /auto-review config [--global|--project|--scope global|--scope project]\n  /auto-review config [--global|--project|--scope global|--scope project] get <key>\n  /auto-review config [--global|--project|--scope global|--scope project] set <key> <value>\n  /auto-review config [--global|--project|--scope global|--scope project] init',
           'warning',
         );
         return;
