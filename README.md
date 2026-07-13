@@ -69,6 +69,8 @@ At runtime:
 
 `/auto-review on` enables review for the current Pi session unless Pi was started with `--no-auto-review` and you want to keep it disabled.
 
+`/auto-review status` also reports which layer is currently deciding the enabled state: the `--no-auto-review` flag, a session `/auto-review on|off` override, the `enabled` config value, or the default. Setting `enabled` via `/auto-review config set enabled <value>` clears any session override so the new config value takes effect immediately.
+
 ## Configuration
 
 `pi-auto-review` supports global and project-level config files.

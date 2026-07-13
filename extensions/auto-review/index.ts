@@ -34,10 +34,21 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   let reviewStartWatchdogTimer: ReturnType<typeof setTimeout> | undefined;
   let startingQueuedReview = false;
 
+  function resolveEnabledState(): { enabled: boolean; source: string } {
+    if (pi.getFlag('no-auto-review') === true) return { enabled: false, source: 'disabled (--no-auto-review flag)' };
+    if (runtimeEnabledOverride === true) return { enabled: true, source: 'enabled (session: /auto-review on)' };
+    if (runtimeEnabledOverride === false) return { enabled: false, source: 'disabled (session: /auto-review off)' };
+    const cfg = config?.enabled;
+    if (cfg === false) return { enabled: false, source: 'disabled (config: enabled=false)' };
+    if (cfg === true) return { enabled: true, source: 'enabled (config: enabled=true)' };
+    // ponytail: pre-session-start defensive guard. session_start always loads config before commands run,
+    // so this branch is unreachable in production; kept as a safe fallback if resolveEnabledState is ever
+    // called before session_start. Upgrade path: remove if config initialization is guaranteed at construction.
+    return { enabled: true, source: 'enabled (default)' };
+  }
+
   function isEnabled(): boolean {
-    if (pi.getFlag('no-auto-review') === true) return false;
-    if (typeof runtimeEnabledOverride === 'boolean') return runtimeEnabledOverride;
-    return config?.enabled ?? true;
+    return resolveEnabledState().enabled;
   }
 
   function formatRuntimeState(): string {
@@ -215,6 +226,10 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
             else writeProjectConfig(ctx.cwd, patch as AutoReviewConfig);
             // Reload config into the active session
             config = getMergedConfig(ctx.cwd);
+            // Setting `enabled` via config is an explicit persistent intent; clear any
+            // session-only runtime override so the new value actually takes effect.
+            // Without this, a prior `/auto-review on|off` would shadow `config set enabled`.
+            if (sub.key === 'enabled') runtimeEnabledOverride = undefined;
             const scopeSuffix = sub.scope === 'global' ? ' (global)' : '';
             ctx.ui.notify(`Set ${sub.key} = ${formatConfigValue(parsed)}${scopeSuffix}`, 'info');
           } catch (err) {
@@ -263,7 +278,8 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
         return;
       }
       if (command === '' || command === 'status') {
-        ctx.ui.notify(`Auto review is ${isEnabled() ? 'enabled' : 'disabled'}; state: ${formatRuntimeState()}`, 'info');
+        const { enabled, source } = resolveEnabledState();
+        ctx.ui.notify(`Auto review is ${enabled ? 'enabled' : 'disabled'}; ${source}; state: ${formatRuntimeState()}`, 'info');
         return;
       }
       ctx.ui.notify('Usage: /auto-review on | off | status | config', 'warning');

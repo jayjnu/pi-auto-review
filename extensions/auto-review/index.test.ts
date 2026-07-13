@@ -126,7 +126,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.session_start[0]({}, ctx);
     await pi.commands['auto-review'].handler('status', ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; state: idle', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; disabled (--no-auto-review flag); state: idle', 'info');
   });
 
   it('warns when runtime on cannot override no-auto-review flag', async () => {
@@ -139,7 +139,7 @@ describe('autoReviewExtension', () => {
     await pi.commands['auto-review'].handler('status', ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review remains disabled because Pi was started with --no-auto-review', 'warning');
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; state: idle', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; disabled (--no-auto-review flag); state: idle', 'info');
   });
 
   it('warns at session start when skill commands are disabled', async () => {
@@ -167,9 +167,32 @@ describe('autoReviewExtension', () => {
     await pi.commands['auto-review'].handler('status', ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review disabled', 'info');
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; state: idle', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; disabled (session: /auto-review off); state: idle', 'info');
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review enabled', 'info');
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (session: /auto-review on); state: idle', 'info');
+  });
+
+  it.each([
+    { name: '--no-auto-review flag true', flag: true, preCommand: undefined, configEnabled: undefined, callSessionStart: true, expected: 'Auto review is disabled; disabled (--no-auto-review flag); state: idle' },
+    { name: '/auto-review off', flag: false, preCommand: 'off', configEnabled: undefined, callSessionStart: true, expected: 'Auto review is disabled; disabled (session: /auto-review off); state: idle' },
+    { name: '/auto-review on', flag: false, preCommand: 'on', configEnabled: undefined, callSessionStart: true, expected: 'Auto review is enabled; enabled (session: /auto-review on); state: idle' },
+    { name: 'config enabled=false', flag: false, preCommand: undefined, configEnabled: false, callSessionStart: true, expected: 'Auto review is disabled; disabled (config: enabled=false); state: idle' },
+    { name: 'config enabled=true', flag: false, preCommand: undefined, configEnabled: true, callSessionStart: true, expected: 'Auto review is enabled; enabled (config: enabled=true); state: idle' },
+    { name: 'pre-session-start default (config not yet loaded)', flag: false, preCommand: undefined, configEnabled: undefined, callSessionStart: false, expected: 'Auto review is enabled; enabled (default); state: idle' },
+  ])('enabled-source: $name', async ({ flag, preCommand, configEnabled, callSessionStart, expected }) => {
+    const pi = createFakePi(flag);
+    const ctx = createFakeContext();
+    if (configEnabled !== undefined) {
+      const dir = createTempDir();
+      ctx.cwd = dir;
+      fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: configEnabled }));
+    }
+    autoReviewExtension(pi as never);
+    if (callSessionStart) await pi.handlers.session_start[0]({}, ctx);
+    if (preCommand !== undefined) await pi.commands['auto-review'].handler(preCommand, ctx);
+    await pi.commands['auto-review'].handler('status', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expected, 'info');
   });
 
   it('resets follow-up review state across session_shutdown and session_start', async () => {
@@ -585,7 +608,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.before_agent_start[0]({ prompt: 'normal user turn' }, ctx);
     expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
     await pi.commands['auto-review'].handler('status', ctx);
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle', 'info');
   });
 
   it('keeps prompts compact after a queued review dispatch fails', async () => {
@@ -666,7 +689,7 @@ describe('autoReviewExtension', () => {
 
       expect(await pi.handlers.tool_call[0]({ toolName: 'edit' }, ctx)).toBeUndefined();
       await pi.commands['auto-review'].handler('status', ctx);
-      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle; completed passes: 1', 'info');
+      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle; completed passes: 1', 'info');
     } finally {
       vi.useRealTimers();
     }
@@ -1203,7 +1226,7 @@ describe('autoReviewExtension', () => {
       await pi.commands['auto-review'].handler('status', ctx);
 
       expect(pi.sendUserMessage).not.toHaveBeenCalled();
-      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
+      expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle', 'info');
     } finally {
       vi.useRealTimers();
     }
@@ -1307,6 +1330,56 @@ describe('autoReviewExtension', () => {
     const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
     const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
     expect(parsed.autoFix).toBe(false);
+  });
+
+  it('config set enabled clears a prior /auto-review on so the value takes effect', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('on', ctx);
+    await pi.commands['auto-review'].handler('config set enabled false', ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    await pi.commands['auto-review'].handler('status', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is disabled; disabled (config: enabled=false); state: idle', 'info');
+  });
+
+  it('config set enabled clears a prior /auto-review off so the value takes effect', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.commands['auto-review'].handler('off', ctx);
+    await pi.commands['auto-review'].handler('config set enabled true', ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    await pi.commands['auto-review'].handler('status', ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle; completed passes: 1', 'info');
   });
 
   it('config --global set writes to global config and reloads', async () => {
@@ -1599,7 +1672,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.before_agent_start[0]({ prompt }, ctx);
     await pi.commands['auto-review'].handler('status', ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle; completed passes: 1', 'info');
+    expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle; completed passes: 1', 'info');
   });
 
   it('stops queueing after maxReviewPasses is reached', async () => {

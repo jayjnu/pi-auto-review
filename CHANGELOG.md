@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.6.1 - 2026-07-13
+
+### Fixed
+- `/auto-review config set enabled <value>` now clears any session-only `/auto-review on|off` override so the new config value takes effect immediately. Previously, a prior runtime override would shadow the config change for the rest of the session.
+
+### Added
+- `/auto-review status` now reports which layer is deciding the enabled state: the `--no-auto-review` flag, a session `/auto-review on|off` override, the `enabled` config value, or the default.
+- Internal `resolveEnabledState()` unifies the enabled-decision and source-description logic into a single source of truth so the status message can never diverge from the actual enabled boolean.
+- Consistency test covering all enabled-state branches (flag, session override, config, default) via `it.each` with per-case isolation.
+
+### Validation
+- `npm test` — 122 tests passed.
+- `npm run typecheck` — passed.
+
 ## v0.6.0 - 2026-07-13
 
 ### Added
