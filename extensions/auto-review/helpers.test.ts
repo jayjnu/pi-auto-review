@@ -121,6 +121,10 @@ describe('isReadOnlyReviewBashCommand', () => {
     expect(isReadOnlyReviewBashCommand('git diff --no-ext-diff')).toBe(true);
     expect(isReadOnlyReviewBashCommand('git status --porcelain')).toBe(true);
     expect(isReadOnlyReviewBashCommand('git ls-files')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature diff --no-ext-diff')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature status --porcelain')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature branch -a -v')).toBe(true);
+    expect(isReadOnlyReviewBashCommand('git -c user.name=bot status --porcelain')).toBe(true);
     expect(isReadOnlyReviewBashCommand('git branch --show-current')).toBe(true);
     expect(isReadOnlyReviewBashCommand('git branch -a -v')).toBe(true);
     expect(isReadOnlyReviewBashCommand("git branch -a 'feature/*'")).toBe(true);
@@ -145,8 +149,11 @@ describe('isReadOnlyReviewBashCommand', () => {
 
   it('blocks mutation-capable bash commands during review', () => {
     expect(isReadOnlyReviewBashCommand('git commit -am fix')).toBe(false);
-    expect(isReadOnlyReviewBashCommand('git diff --ext-diff')).toBe(false);
-    expect(isReadOnlyReviewBashCommand('git diff --external-diff')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature diff --ext-diff')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature diff --external-diff')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature diff --output=review.patch')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature branch -D old-branch')).toBe(false);
+    expect(isReadOnlyReviewBashCommand('git -C .worktree/feature tag -d v1.0.0')).toBe(false);
     expect(isReadOnlyReviewBashCommand('git branch -D old-branch')).toBe(false);
     expect(isReadOnlyReviewBashCommand('git branch --delete old-branch')).toBe(false);
     expect(isReadOnlyReviewBashCommand('git branch --move old new')).toBe(false);

@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AutoReviewConfig, ConfigKey } from './config.ts';
 import { formatConfigValue, getGlobalConfigPath, getMergedConfig, getProjectConfigPath, initGlobalConfig, initProjectConfig, isValidConfigKey, parseConfigValue, readGlobalConfig, readProjectConfig, writeGlobalConfig, writeProjectConfig } from './config.ts';
-import { CURRENT_WORKTREE_PATHSPECS, areSkillCommandsEnabled, buildReviewPrompt, filterCurrentWorktreeStatus, isAutoReviewFixerSubagentInput, isCurrentWorktreeReviewFile, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
+import { CURRENT_WORKTREE_PATHSPECS, areSkillCommandsEnabled, buildReviewPrompt, filterCurrentWorktreeStatus, isAutoReviewFixerSubagentInput, isCurrentWorktreeReviewFile, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview, splitSimpleCommand } from './helpers.ts';
 
 export default function autoReviewExtension(pi: ExtensionAPI) {
   // pi-subagents launches child agents as separate Pi processes. User/project
@@ -315,50 +315,17 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     }
   }
 
+  function resetReviewScope(): void {
+    reviewCwd = '';
+    reviewCwdLocked = false;
+    lastQueuedReviewFingerprint = '';
+  }
+
   function resolveFileProbeCwd(input: Record<string, unknown> | undefined, ctxCwd: string): string {
     const file = getInputPath(input);
     const base = resolveAgainstCtxCwd(ctxCwd, getInputCwd(input));
     if (!file) return base;
     return findExistingDirectory(path.dirname(path.resolve(base, file)), ctxCwd);
-  }
-
-  function splitSimpleCommand(command: string): string[] {
-    const tokens: string[] = [];
-    let current = '';
-    let quote: 'single' | 'double' | undefined;
-    let escaped = false;
-
-    for (const char of command) {
-      if (escaped) {
-        current += char;
-        escaped = false;
-        continue;
-      }
-      if (char === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (char === "'" && quote !== 'double') {
-        quote = quote === 'single' ? undefined : 'single';
-        continue;
-      }
-      if (char === '"' && quote !== 'single') {
-        quote = quote === 'double' ? undefined : 'double';
-        continue;
-      }
-      if (/\s/.test(char) && quote === undefined) {
-        if (current.length > 0) {
-          tokens.push(current);
-          current = '';
-        }
-        continue;
-      }
-      current += char;
-    }
-
-    if (escaped) current += '\\';
-    if (current.length > 0) tokens.push(current);
-    return tokens;
   }
 
   function extractGitCPath(command: string, ctxCwd: string): string | undefined {
@@ -398,6 +365,10 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     reviewCwdLocked = true;
   }
 
+  // ponytail: silent fallback is deliberate best-effort (the `safe` prefix signals it).
+  // Ceiling: git failures become invisible — review may run against ctxCwd with no diagnostic.
+  // Upgrade path: thread ctx.ui.notify or a logger call into the catch blocks when git-failure
+  // diagnosability is needed.
   async function safeLockReviewCwd(cwd: string, ctxCwd: string, signal?: AbortSignal): Promise<void> {
     try {
       await lockReviewCwd(cwd, signal);
@@ -458,26 +429,20 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     }
     clearQueuedReview();
     reviewPassCount = 0;
-    reviewCwd = '';
-    reviewCwdLocked = false;
-    lastQueuedReviewFingerprint = '';
+    resetReviewScope();
   });
 
   pi.on('session_shutdown', async () => {
     clearQueuedReview();
     reviewPassCount = 0;
-    reviewCwd = '';
-    reviewCwdLocked = false;
-    lastQueuedReviewFingerprint = '';
+    resetReviewScope();
   });
 
   pi.on('input', async (event, ctx) => {
     if (!reviewQueued) {
       if (event.source !== 'extension') {
         reviewPassCount = 0;
-        reviewCwd = '';
-        reviewCwdLocked = false;
-        lastQueuedReviewFingerprint = '';
+        resetReviewScope();
       }
       return;
     }
@@ -558,86 +523,96 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.on('agent_end', async (_event, ctx) => {
-    const effectiveReviewCwd = reviewCwd || await getWorktreeRoot(ctx.cwd, ctx.signal);
-    const afterStatus = await getStatus(effectiveReviewCwd, ctx.signal);
-    const afterHead = await getHead(effectiveReviewCwd, ctx.signal);
-    let worktreeDiff: string | undefined;
-    let cachedDiff: string | undefined;
-    let untrackedSnapshot: string | undefined;
+    // ponytail: best-effort review trigger. If git inspection fails, the review is silently skipped.
+    // Ceiling: subprocess failures become invisible. Upgrade path: ctx.ui.notify when diagnosability is needed.
+    try {
+      const effectiveReviewCwd = reviewCwd || await getWorktreeRoot(ctx.cwd, ctx.signal);
+      const [afterStatus, afterHead] = await Promise.all([
+        getStatus(effectiveReviewCwd, ctx.signal),
+        getHead(effectiveReviewCwd, ctx.signal),
+      ]);
+      let worktreeDiff: string | undefined;
+      let cachedDiff: string | undefined;
+      let untrackedSnapshot: string | undefined;
 
-    if (capturedFixerDiffSnapshot) {
-      worktreeDiff = await getWorktreeDiff(effectiveReviewCwd, ctx.signal);
-      cachedDiff = await getCachedDiff(effectiveReviewCwd, ctx.signal);
-      untrackedSnapshot = await getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal);
+      if (capturedFixerDiffSnapshot) {
+        [worktreeDiff, cachedDiff, untrackedSnapshot] = await Promise.all([
+          getWorktreeDiff(effectiveReviewCwd, ctx.signal),
+          getCachedDiff(effectiveReviewCwd, ctx.signal),
+          getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal),
+        ]);
+      }
+
+      const fixerChangedGitState = sawFixerSubagent && (
+        beforeStatus.trim() !== afterStatus.trim()
+        || beforeHead.trim() !== afterHead.trim()
+        || (capturedFixerDiffSnapshot && (
+          beforeFixerWorktreeDiff !== (worktreeDiff ?? '')
+          || beforeFixerCachedDiff !== (cachedDiff ?? '')
+          || beforeFixerUntrackedSnapshot !== (untrackedSnapshot ?? '')
+        ))
+      );
+
+      if (!shouldRunReview({
+        enabled: isEnabled(),
+        reviewQueued,
+        reviewInProgress: false,
+        sawMutationTool: sawMutationTool || fixerChangedGitState,
+        beforeStatus,
+        afterStatus,
+        beforeHead,
+        afterHead,
+      })) {
+        return;
+      }
+
+      const changedFiles = parseChangedFiles(afterStatus);
+      const committedFiles = beforeHead && afterHead && beforeHead !== afterHead
+        ? await pi.exec('git', gitArgs(effectiveReviewCwd, ['diff', '--name-only', '-z', `${beforeHead}..${afterHead}`, '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal: ctx.signal })
+        : { stdout: '', code: 0 };
+      const allChangedFiles = Array.from(new Set([
+        ...changedFiles,
+        ...(committedFiles.code === 0 ? committedFiles.stdout.split('\0').filter((file) => file.length > 0 && isCurrentWorktreeReviewFile(file)) : []),
+      ]));
+      if (allChangedFiles.length === 0) return;
+
+      worktreeDiff ??= await getWorktreeDiff(effectiveReviewCwd, ctx.signal);
+      cachedDiff ??= await getCachedDiff(effectiveReviewCwd, ctx.signal);
+      if (untrackedSnapshot === undefined && hasUntrackedFiles(afterStatus)) {
+        untrackedSnapshot = await getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal);
+      }
+      const reviewFingerprint = buildReviewFingerprint({
+        status: afterStatus,
+        beforeHead,
+        afterHead,
+        files: allChangedFiles,
+        worktreeDiff,
+        cachedDiff,
+        untrackedSnapshot: untrackedSnapshot ?? '',
+      });
+      if (reviewFingerprint === lastQueuedReviewFingerprint) return;
+
+      const maxReviewPasses = config?.maxReviewPasses ?? null;
+      if (maxReviewPasses !== null && reviewPassCount >= maxReviewPasses) {
+        if (ctx.hasUI) ctx.ui.notify(`Auto review stopped after ${reviewPassCount} pass(es); maxReviewPasses is ${maxReviewPasses}.`, 'info');
+        return;
+      }
+
+      const prompt = buildReviewPrompt({
+        status: afterStatus,
+        beforeHead,
+        afterHead,
+        reviewCwd: effectiveReviewCwd !== ctx.cwd ? effectiveReviewCwd : undefined,
+      });
+
+      lastQueuedReviewFingerprint = reviewFingerprint;
+      reviewQueued = true;
+      queuedReviewPrompt = prompt;
+      queuedReviewPass = reviewPassCount + 1;
+      if (ctx.hasUI) ctx.ui.notify(`Auto review queued (pass ${queuedReviewPass})`, 'info');
+      startQueuedReviewWhenIdle(ctx);
+    } catch {
+      // Best-effort: if git inspection fails, skip this review trigger silently.
     }
-
-    const fixerChangedGitState = sawFixerSubagent && (
-      beforeStatus.trim() !== afterStatus.trim()
-      || beforeHead.trim() !== afterHead.trim()
-      || (capturedFixerDiffSnapshot && (
-        beforeFixerWorktreeDiff !== (worktreeDiff ?? '')
-        || beforeFixerCachedDiff !== (cachedDiff ?? '')
-        || beforeFixerUntrackedSnapshot !== (untrackedSnapshot ?? '')
-      ))
-    );
-
-    if (!shouldRunReview({
-      enabled: isEnabled(),
-      reviewQueued,
-      reviewInProgress: false,
-      sawMutationTool: sawMutationTool || fixerChangedGitState,
-      beforeStatus,
-      afterStatus,
-      beforeHead,
-      afterHead,
-    })) {
-      return;
-    }
-
-    const changedFiles = parseChangedFiles(afterStatus);
-    const committedFiles = beforeHead && afterHead && beforeHead !== afterHead
-      ? await pi.exec('git', gitArgs(effectiveReviewCwd, ['diff', '--name-only', '-z', `${beforeHead}..${afterHead}`, '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal: ctx.signal })
-      : { stdout: '', code: 0 };
-    const allChangedFiles = Array.from(new Set([
-      ...changedFiles,
-      ...(committedFiles.code === 0 ? committedFiles.stdout.split('\0').filter((file) => file.length > 0 && isCurrentWorktreeReviewFile(file)) : []),
-    ]));
-    if (allChangedFiles.length === 0) return;
-
-    worktreeDiff ??= await getWorktreeDiff(effectiveReviewCwd, ctx.signal);
-    cachedDiff ??= await getCachedDiff(effectiveReviewCwd, ctx.signal);
-    if (untrackedSnapshot === undefined && hasUntrackedFiles(afterStatus)) {
-      untrackedSnapshot = await getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal);
-    }
-    const reviewFingerprint = buildReviewFingerprint({
-      status: afterStatus,
-      beforeHead,
-      afterHead,
-      files: allChangedFiles,
-      worktreeDiff,
-      cachedDiff,
-      untrackedSnapshot: untrackedSnapshot ?? '',
-    });
-    if (reviewFingerprint === lastQueuedReviewFingerprint) return;
-
-    const maxReviewPasses = config?.maxReviewPasses ?? null;
-    if (maxReviewPasses !== null && reviewPassCount >= maxReviewPasses) {
-      if (ctx.hasUI) ctx.ui.notify(`Auto review stopped after ${reviewPassCount} pass(es); maxReviewPasses is ${maxReviewPasses}.`, 'info');
-      return;
-    }
-
-    const prompt = buildReviewPrompt({
-      status: afterStatus,
-      beforeHead,
-      afterHead,
-      reviewCwd: effectiveReviewCwd !== ctx.cwd ? effectiveReviewCwd : undefined,
-    });
-
-    lastQueuedReviewFingerprint = reviewFingerprint;
-    reviewQueued = true;
-    queuedReviewPrompt = prompt;
-    queuedReviewPass = reviewPassCount + 1;
-    if (ctx.hasUI) ctx.ui.notify(`Auto review queued (pass ${queuedReviewPass})`, 'info');
-    startQueuedReviewWhenIdle(ctx);
   });
 }

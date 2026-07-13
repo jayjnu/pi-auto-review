@@ -104,7 +104,7 @@ export function isLikelyMutatingBashCommand(command: string): boolean {
   return false;
 }
 
-function splitSimpleCommand(command: string): string[] {
+export function splitSimpleCommand(command: string): string[] {
   const tokens: string[] = [];
   let current = '';
   let quote: 'single' | 'double' | undefined;
@@ -266,19 +266,18 @@ export function isReadOnlyReviewBashCommand(command: string): boolean {
   // metacharacters like `rg 'foo|bar'` are allowed.
   if (hasUnsafeShellMetaOutsideQuotes(trimmed)) return false;
 
-  const [binary = ''] = trimmed.split(/\s+/, 1);
+  const tokens = splitSimpleCommand(trimmed);
+  const [binary = ''] = tokens;
   if (binary === 'git') {
-    if (/\s--output(?:=|\s)/.test(trimmed)) return false;
-    if (/\s--(?:ext-diff|external-diff)\b/.test(trimmed)) return false;
-    if (/^git\s+branch\b/.test(trimmed)) {
-      const rest = trimmed.replace(/^git\s+branch\b/, '').trim();
-      return isReadOnlyGitBranch(rest);
-    }
-    if (/^git\s+tag\b/.test(trimmed)) {
-      const rest = trimmed.replace(/^git\s+tag\b/, '').trim();
-      return isReadOnlyGitTag(rest);
-    }
-    return /^git\s+(?:blame|diff|ls-files|log|rev-parse|show|status)\b/.test(trimmed);
+    const parsed = parseGitCommand(tokens);
+    if (!parsed) return false;
+    const { subcommand, rest } = parsed;
+    // Block flags that can execute external commands or write output to disk.
+    if (rest.some((t) => t === '--output' || t.startsWith('--output='))) return false;
+    if (rest.some((t) => t === '--ext-diff' || t === '--external-diff')) return false;
+    if (subcommand === 'branch') return isReadOnlyGitBranch(rest.join(' '));
+    if (subcommand === 'tag') return isReadOnlyGitTag(rest.join(' '));
+    return ['blame', 'diff', 'ls-files', 'log', 'rev-parse', 'show', 'status'].includes(subcommand);
   }
 
   if (binary === 'find') {
@@ -315,10 +314,10 @@ export function filterCurrentWorktreeStatus(status: string): string {
 }
 
 export function parseChangedFiles(status: string): string[] {
-  return filterCurrentWorktreeStatus(status)
+  return status
     .split('\n')
     .map((line) => line.trimEnd())
-    .filter((line) => line.trim().length > 0)
+    .filter((line) => line.trim().length > 0 && parseStatusLineFiles(line).some(isCurrentWorktreeReviewFile))
     .map(parseStatusLineReviewFile)
     .filter((file) => file.length > 0);
 }
