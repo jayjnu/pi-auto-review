@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AutoReviewConfig, ConfigKey } from './config.ts';
 import { formatConfigValue, getGlobalConfigPath, getMergedConfig, getProjectConfigPath, initGlobalConfig, initProjectConfig, isValidConfigKey, parseConfigValue, readGlobalConfig, readProjectConfig, writeGlobalConfig, writeProjectConfig } from './config.ts';
-import { areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
+import { CURRENT_WORKTREE_PATHSPECS, areSkillCommandsEnabled, buildReviewPrompt, filterCurrentWorktreeStatus, isAutoReviewFixerSubagentInput, isCurrentWorktreeReviewFile, isFileMutationToolResult, isLikelyMutatingBashCommand, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 export default function autoReviewExtension(pi: ExtensionAPI) {
   // pi-subagents launches child agents as separate Pi processes. User/project
@@ -24,6 +26,8 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   let beforeFixerWorktreeDiff = '';
   let beforeFixerCachedDiff = '';
   let beforeFixerUntrackedSnapshot = '';
+  let reviewCwd = '';
+  let reviewCwdLocked = false;
   let lastQueuedReviewFingerprint = '';
   let queuedReviewPrompt: string | undefined;
   let reviewStartTimer: ReturnType<typeof setTimeout> | undefined;
@@ -270,25 +274,162 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     return result.code === 0 ? result.stdout : `${result.code}:${result.stderr ?? ''}`;
   }
 
-  async function getHead(signal?: AbortSignal): Promise<string> {
-    const result = await pi.exec('git', ['rev-parse', '--verify', 'HEAD'], { signal });
+  function gitArgs(cwd: string, args: string[]): string[] {
+    return ['-C', cwd, ...args];
+  }
+
+  async function getHead(cwd: string, signal?: AbortSignal): Promise<string> {
+    const result = await pi.exec('git', gitArgs(cwd, ['rev-parse', '--verify', 'HEAD']), { signal });
     return result.code === 0 ? result.stdout.trim() : '';
   }
 
-  async function getWorktreeDiff(signal?: AbortSignal): Promise<string> {
-    return formatGitOutput(await pi.exec('git', ['diff', '--no-ext-diff'], { signal }));
+  async function getWorktreeRoot(cwd: string, signal?: AbortSignal): Promise<string> {
+    const result = await pi.exec('git', gitArgs(cwd, ['rev-parse', '--show-toplevel']), { signal });
+    const root = result.code === 0 ? result.stdout.trim() : '';
+    return path.isAbsolute(root) ? root : cwd;
   }
 
-  async function getCachedDiff(signal?: AbortSignal): Promise<string> {
-    return formatGitOutput(await pi.exec('git', ['diff', '--cached', '--no-ext-diff'], { signal }));
+  function getInputCwd(input: Record<string, unknown> | undefined): string | undefined {
+    return typeof input?.cwd === 'string' && input.cwd.trim().length > 0 ? input.cwd.trim() : undefined;
+  }
+
+  function getInputPath(input: Record<string, unknown> | undefined): string | undefined {
+    return typeof input?.path === 'string' && input.path.trim().length > 0 ? input.path.trim() : undefined;
+  }
+
+  function resolveAgainstCtxCwd(ctxCwd: string, cwd: string | undefined): string {
+    return path.resolve(ctxCwd, cwd ?? '.');
+  }
+
+  function findExistingDirectory(startDir: string, fallback: string): string {
+    let current = startDir;
+    while (true) {
+      const parent = path.dirname(current);
+      if (parent === current) return fallback;
+      try {
+        if (fs.existsSync(current) && fs.statSync(current).isDirectory()) return current;
+      } catch {
+        // Keep walking upward; this is only a best-effort pre-mutation probe.
+      }
+      current = parent;
+    }
+  }
+
+  function resolveFileProbeCwd(input: Record<string, unknown> | undefined, ctxCwd: string): string {
+    const file = getInputPath(input);
+    const base = resolveAgainstCtxCwd(ctxCwd, getInputCwd(input));
+    if (!file) return base;
+    return findExistingDirectory(path.dirname(path.resolve(base, file)), ctxCwd);
+  }
+
+  function splitSimpleCommand(command: string): string[] {
+    const tokens: string[] = [];
+    let current = '';
+    let quote: 'single' | 'double' | undefined;
+    let escaped = false;
+
+    for (const char of command) {
+      if (escaped) {
+        current += char;
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === "'" && quote !== 'double') {
+        quote = quote === 'single' ? undefined : 'single';
+        continue;
+      }
+      if (char === '"' && quote !== 'single') {
+        quote = quote === 'double' ? undefined : 'double';
+        continue;
+      }
+      if (/\s/.test(char) && quote === undefined) {
+        if (current.length > 0) {
+          tokens.push(current);
+          current = '';
+        }
+        continue;
+      }
+      current += char;
+    }
+
+    if (escaped) current += '\\';
+    if (current.length > 0) tokens.push(current);
+    return tokens;
+  }
+
+  function extractGitCPath(command: string, ctxCwd: string): string | undefined {
+    const tokens = splitSimpleCommand(command.trim());
+    if (tokens[0] !== 'git') return undefined;
+
+    let resolvedCwd: string | undefined;
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index] ?? '';
+      if (token === '-C') {
+        const gitCwd = tokens[index + 1];
+        if (!gitCwd) return resolvedCwd;
+        resolvedCwd = path.resolve(resolvedCwd ?? ctxCwd, gitCwd);
+        index += 1;
+        continue;
+      }
+      if (token === '-c' || token === '--git-dir' || token === '--work-tree') {
+        index += 1;
+        continue;
+      }
+      if (token.startsWith('--git-dir=') || token.startsWith('--work-tree=')) continue;
+      return resolvedCwd;
+    }
+
+    return resolvedCwd;
+  }
+
+  async function captureReviewBaseline(cwd: string, signal?: AbortSignal, options: { resolveRoot?: boolean } = {}): Promise<void> {
+    reviewCwd = options.resolveRoot === true ? await getWorktreeRoot(cwd, signal) : cwd;
+    beforeStatus = await getStatus(reviewCwd, signal);
+    beforeHead = await getHead(reviewCwd, signal);
+  }
+
+  async function lockReviewCwd(cwd: string, signal?: AbortSignal): Promise<void> {
+    if (reviewCwdLocked) return;
+    await captureReviewBaseline(cwd, signal, { resolveRoot: true });
+    reviewCwdLocked = true;
+  }
+
+  async function safeLockReviewCwd(cwd: string, ctxCwd: string, signal?: AbortSignal): Promise<void> {
+    try {
+      await lockReviewCwd(cwd, signal);
+    } catch {
+      try {
+        await captureReviewBaseline(ctxCwd, signal);
+      } catch {
+        reviewCwd = ctxCwd;
+      }
+      reviewCwdLocked = true;
+    }
+  }
+
+  async function getStatus(cwd: string, signal?: AbortSignal): Promise<string> {
+    const result = await pi.exec('git', gitArgs(cwd, ['status', '--porcelain', '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal });
+    return result.code === 0 ? filterCurrentWorktreeStatus(result.stdout) : '';
+  }
+
+  async function getWorktreeDiff(cwd: string, signal?: AbortSignal): Promise<string> {
+    return formatGitOutput(await pi.exec('git', gitArgs(cwd, ['diff', '--no-ext-diff', '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal }));
+  }
+
+  async function getCachedDiff(cwd: string, signal?: AbortSignal): Promise<string> {
+    return formatGitOutput(await pi.exec('git', gitArgs(cwd, ['diff', '--cached', '--no-ext-diff', '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal }));
   }
 
   function hasUntrackedFiles(status: string): boolean {
     return status.split('\n').some((line) => line.startsWith('?? '));
   }
 
-  async function getUntrackedFileSnapshot(signal?: AbortSignal): Promise<string> {
-    const listed = await pi.exec('git', ['ls-files', '--others', '--exclude-standard', '-z'], { signal });
+  async function getUntrackedFileSnapshot(cwd: string, signal?: AbortSignal): Promise<string> {
+    const listed = await pi.exec('git', gitArgs(cwd, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal });
     if (listed.code !== 0) return `${listed.code}:${listed.stderr ?? ''}`;
 
     const files = listed.stdout.split('\0').filter(Boolean).sort();
@@ -298,7 +439,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     const chunkSize = 100;
     for (let index = 0; index < files.length; index += chunkSize) {
       const chunk = files.slice(index, index + chunkSize);
-      const hashed = await pi.exec('git', ['hash-object', '--', ...chunk], { signal });
+      const hashed = await pi.exec('git', gitArgs(cwd, ['hash-object', '--', ...chunk]), { signal });
       if (hashed.code !== 0) return JSON.stringify({ files, error: `${hashed.code}:${hashed.stderr ?? ''}` });
       const hashes = hashed.stdout.split('\n').filter(Boolean);
       for (let offset = 0; offset < chunk.length; offset += 1) {
@@ -317,12 +458,16 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     }
     clearQueuedReview();
     reviewPassCount = 0;
+    reviewCwd = '';
+    reviewCwdLocked = false;
     lastQueuedReviewFingerprint = '';
   });
 
   pi.on('session_shutdown', async () => {
     clearQueuedReview();
     reviewPassCount = 0;
+    reviewCwd = '';
+    reviewCwdLocked = false;
     lastQueuedReviewFingerprint = '';
   });
 
@@ -330,6 +475,8 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     if (!reviewQueued) {
       if (event.source !== 'extension') {
         reviewPassCount = 0;
+        reviewCwd = '';
+        reviewCwdLocked = false;
         lastQueuedReviewFingerprint = '';
       }
       return;
@@ -347,15 +494,40 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.on('tool_call', async (event, ctx) => {
-    if (event.toolName !== 'subagent') return;
     const input = event.input && typeof event.input === 'object' ? event.input as Record<string, unknown> : undefined;
+
+    if (event.toolName === 'edit' || event.toolName === 'write') {
+      const file = getInputPath(input);
+      if (file) await safeLockReviewCwd(resolveFileProbeCwd(input, ctx.cwd), ctx.cwd, ctx.signal);
+      return;
+    }
+
+    if (event.toolName === 'bash') {
+      const command = typeof input?.command === 'string' ? input.command : '';
+      if (isLikelyMutatingBashCommand(command)) {
+        const gitCPath = extractGitCPath(command, ctx.cwd);
+        const cwd = gitCPath ?? resolveAgainstCtxCwd(ctx.cwd, getInputCwd(input));
+        await safeLockReviewCwd(cwd, ctx.cwd, ctx.signal);
+      }
+      return;
+    }
+
+    if (event.toolName !== 'subagent') return;
     if (!isAutoReviewFixerSubagentInput(input, config?.fixerAgent ?? 'worker')) return;
+    await safeLockReviewCwd(resolveAgainstCtxCwd(ctx.cwd, getInputCwd(input)), ctx.cwd, ctx.signal);
     if (capturedFixerDiffSnapshot) return;
 
-    beforeFixerWorktreeDiff = await getWorktreeDiff(ctx.signal);
-    beforeFixerCachedDiff = await getCachedDiff(ctx.signal);
-    beforeFixerUntrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
-    capturedFixerDiffSnapshot = true;
+    try {
+      beforeFixerWorktreeDiff = await getWorktreeDiff(reviewCwd, ctx.signal);
+      beforeFixerCachedDiff = await getCachedDiff(reviewCwd, ctx.signal);
+      beforeFixerUntrackedSnapshot = await getUntrackedFileSnapshot(reviewCwd, ctx.signal);
+      capturedFixerDiffSnapshot = true;
+    } catch {
+      beforeFixerWorktreeDiff = '';
+      beforeFixerCachedDiff = '';
+      beforeFixerUntrackedSnapshot = '';
+      capturedFixerDiffSnapshot = false;
+    }
   });
 
   pi.on('agent_start', async (_event, ctx) => {
@@ -365,10 +537,10 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     beforeFixerWorktreeDiff = '';
     beforeFixerCachedDiff = '';
     beforeFixerUntrackedSnapshot = '';
+    reviewCwd = '';
+    reviewCwdLocked = false;
 
-    const status = await pi.exec('git', ['status', '--porcelain'], { signal: ctx.signal });
-    beforeStatus = status.code === 0 ? status.stdout : '';
-    beforeHead = await getHead(ctx.signal);
+    await captureReviewBaseline(ctx.cwd, ctx.signal);
   });
 
   pi.on('tool_result', async (event) => {
@@ -386,17 +558,17 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.on('agent_end', async (_event, ctx) => {
-    const status = await pi.exec('git', ['status', '--porcelain'], { signal: ctx.signal });
-    const afterStatus = status.code === 0 ? status.stdout : '';
-    const afterHead = await getHead(ctx.signal);
+    const effectiveReviewCwd = reviewCwd || await getWorktreeRoot(ctx.cwd, ctx.signal);
+    const afterStatus = await getStatus(effectiveReviewCwd, ctx.signal);
+    const afterHead = await getHead(effectiveReviewCwd, ctx.signal);
     let worktreeDiff: string | undefined;
     let cachedDiff: string | undefined;
     let untrackedSnapshot: string | undefined;
 
     if (capturedFixerDiffSnapshot) {
-      worktreeDiff = await getWorktreeDiff(ctx.signal);
-      cachedDiff = await getCachedDiff(ctx.signal);
-      untrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
+      worktreeDiff = await getWorktreeDiff(effectiveReviewCwd, ctx.signal);
+      cachedDiff = await getCachedDiff(effectiveReviewCwd, ctx.signal);
+      untrackedSnapshot = await getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal);
     }
 
     const fixerChangedGitState = sawFixerSubagent && (
@@ -424,17 +596,18 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
 
     const changedFiles = parseChangedFiles(afterStatus);
     const committedFiles = beforeHead && afterHead && beforeHead !== afterHead
-      ? await pi.exec('git', ['diff', '--name-only', '-z', `${beforeHead}..${afterHead}`], { signal: ctx.signal })
+      ? await pi.exec('git', gitArgs(effectiveReviewCwd, ['diff', '--name-only', '-z', `${beforeHead}..${afterHead}`, '--', ...CURRENT_WORKTREE_PATHSPECS]), { signal: ctx.signal })
       : { stdout: '', code: 0 };
     const allChangedFiles = Array.from(new Set([
       ...changedFiles,
-      ...(committedFiles.code === 0 ? committedFiles.stdout.split('\0').filter(Boolean) : []),
+      ...(committedFiles.code === 0 ? committedFiles.stdout.split('\0').filter((file) => file.length > 0 && isCurrentWorktreeReviewFile(file)) : []),
     ]));
+    if (allChangedFiles.length === 0) return;
 
-    worktreeDiff ??= await getWorktreeDiff(ctx.signal);
-    cachedDiff ??= await getCachedDiff(ctx.signal);
+    worktreeDiff ??= await getWorktreeDiff(effectiveReviewCwd, ctx.signal);
+    cachedDiff ??= await getCachedDiff(effectiveReviewCwd, ctx.signal);
     if (untrackedSnapshot === undefined && hasUntrackedFiles(afterStatus)) {
-      untrackedSnapshot = await getUntrackedFileSnapshot(ctx.signal);
+      untrackedSnapshot = await getUntrackedFileSnapshot(effectiveReviewCwd, ctx.signal);
     }
     const reviewFingerprint = buildReviewFingerprint({
       status: afterStatus,
@@ -454,10 +627,10 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     }
 
     const prompt = buildReviewPrompt({
-      changedFiles: allChangedFiles,
       status: afterStatus,
       beforeHead,
       afterHead,
+      reviewCwd: effectiveReviewCwd !== ctx.cwd ? effectiveReviewCwd : undefined,
     });
 
     lastQueuedReviewFingerprint = reviewFingerprint;

@@ -9,12 +9,17 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
 
 ## Required Flow
 
-1. Treat the trigger prompt as intentionally minimal. Do not expect changed-file lists or diff details in the prompt for normal dirty-worktree reviews.
-2. If the trigger prompt includes an `Auto-review context` block with `Committed clean-worktree range: <before>..<after>`, first decide whether this is a new review target or only a bookkeeping follow-up for changes already reviewed in this session. Do **not** dispatch subagents merely because `HEAD` changed, but also do **not** skip based only on conversation memory. Before skipping, perform a cheap read-only range inspection such as `git diff --name-only <before>..<after>` and, when file names are not enough to classify the range, a compact `git diff --no-ext-diff <before>..<after>` or `git log --oneline <before>..<after>` check. Skip only when confidence is high that the range is the same work already reviewed/fixed/validated in the current session and contains no new unreviewed source/config/dependency/docs changes beyond bookkeeping. In particular, do not skip a release/version-bump commit if the inspected range includes new unreviewed code, config, dependency, or docs changes. If confidence is not high, proceed with normal committed-range review. When you do skip, output only a single muted/dim status line: `[auto-review] 이미 리뷰된 변경의 commit/release 후속 작업이라 추가 리뷰를 생략합니다` and stop.
-3. For a committed clean-worktree range that is not an already-reviewed bookkeeping follow-up, use that compact range as the primary review target. Inspect the committed range with read-only commands such as `git diff --name-only <before>..<after>` and `git diff --no-ext-diff <before>..<after>`. Use any `Changed files:` line as a hint only; verify the range directly. Include this range context in every reviewer task so reviewers inspect the committed changes instead of the currently clean worktree.
-4. Before dispatching any subagent, decide whether there is a meaningful review target in the current context. Use the explicit committed range when present and not skipped by the bookkeeping guard; otherwise use the conversation, prior reviewer findings, recent tool results, known edits/fixes, and read-only signals such as `git status --porcelain`, `git diff --no-ext-diff`, `git diff --cached --no-ext-diff`, or recent `HEAD` inspection.
-5. If there is no plausible code change, unresolved reviewer finding, or other reviewable artifact to inspect, do not call subagents. Output only a single muted/dim status line: `[auto-review] 리뷰할만한 변경이 없습니다` and stop.
-6. Determine the effective `pi-auto-review` config before fanout/fixer orchestration. Merge precedence is `defaults < global config (~/.pi/agent/extensions/auto-review/config.json) < project config (.pi/extensions/auto-review/config.json)`. Apply the same normalization as the extension: ignore unknown keys; ignore invalid or missing values and keep the lower-priority/default value; ignore empty `reviewerAgent`/`fixerAgent`; require booleans to be actual booleans; require positive numbers where numeric; require `reviewConcurrency` to be a positive integer capped at `8` and defaulting to `4`; require `maxReviewPasses` to be `null` or a positive integer; require `reviewerSkills`/`fixerSkills` to be string arrays in JSON config (the `/auto-review config set ...Skills a b` command accepts space-separated input because it writes an array); require `reviewerProfiles` to be a JSON array of objects with non-empty `id` and optional `agent`, `model`, `skills`, `task`, `taskExtra`, `label`, and boolean `enabled`. Merge `reviewerProfiles` by `id` across global and project config so project profiles can override fields, add fields, inherit omitted fields, or set `enabled: false` for global profiles. A project override may omit `task` to inherit a global profile task by id. A new enabled profile needs a non-empty `task` before it can create a standalone reviewer task. Do not treat `null` or empty strings as an unset mechanism for inherited optional profile fields such as `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`; null-clearing is not supported in this pass. Defaults are:
+1. Treat the trigger prompt as intentionally compact. Do not expect changed-file lists in the prompt. Derive changed files yourself with scoped read-only git commands before dispatching reviewers; when range details are present, use them as hints only and verify directly.
+2. **Constrain review scope to the selected worktree root.** The review target is always the Git worktree selected for this auto-review pass. If the trigger prompt includes `Review worktree root: <path>`, use that absolute path as `reviewCwd`; otherwise resolve the current worktree root with a scoped read-only command such as `git rev-parse --show-toplevel` and call that absolute path `reviewCwd`. A worktree whose absolute path is itself under a parent repository's `.worktree/<name>` directory is still in scope when `reviewCwd` points to it. Exclude only nested sibling worktree directories that appear **inside `reviewCwd` itself**, using root-relative Git pathspecs evaluated from `reviewCwd` such as `git status --porcelain -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'` and `git diff --no-ext-diff -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'`. Do not dispatch reviewers or fixers only when the selected `reviewCwd` has no in-scope changes after those root-relative exclusions.
+3. If the trigger prompt includes an `Auto-review context` block with `Committed clean-worktree range: <before>..<after>`, first decide whether this is a new review target or only a bookkeeping follow-up for changes already reviewed in this session. Do **not** dispatch subagents merely because `HEAD` changed, but also do **not** skip based only on conversation memory. Before skipping, perform a cheap scoped read-only range inspection such as `git diff --name-only <before>..<after> -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'`, and when file names are not enough to classify the range, a compact scoped `git diff --no-ext-diff <before>..<after> -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'` or `git log --oneline <before>..<after>` check. Skip only when confidence is high that the range is the same work already reviewed/fixed/validated in the current session and contains no new unreviewed source/config/dependency/docs changes beyond bookkeeping. In particular, do not skip a release/version-bump commit if the inspected range includes new unreviewed code, config, dependency, or docs changes. If confidence is not high, proceed with normal committed-range review. When you do skip, output only a single muted/dim status line: `[auto-review] 이미 리뷰된 변경의 commit/release 후속 작업이라 추가 리뷰를 생략합니다` and stop.
+4. For a committed clean-worktree range that is not an already-reviewed bookkeeping follow-up, use that compact range as the primary review target. Inspect the committed range with read-only commands such as `git diff --name-only <before>..<after> -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'` and `git diff --no-ext-diff <before>..<after> -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'`. Derive changed files from those scoped commands rather than from the trigger prompt. Include this range context in every reviewer task so reviewers inspect the committed changes instead of the currently clean worktree.
+5. **Perform a mandatory review-worthiness gate before dispatching any subagent.** Do not treat the `/skill:auto-review` trigger itself as sufficient justification to run reviewers. Perform cheap read-only inspection and apply **all** of the following skip rules. If any rule matches, skip the review and output only a single muted/dim status line.
+   - **Skip rule A — No meaningful diff**: Run `git status --porcelain -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'` and `git diff --no-ext-diff -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'`. If the scoped current worktree is completely clean, no staged changes exist, and there is no committed range context in the trigger prompt, skip with: `[auto-review] 리뷰할만한 변경이 없습니다`
+   - **Skip rule B — Trivial/irrelevant changes only**: If the only changed files are lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `Cargo.lock`, `Gemfile.lock`, `poetry.lock`, `composer.lock`), auto-generated files (`CHANGELOG.md` from version bumps, generated API clients, dist/build artifacts, `.d.ts` files from codegen), or pure formatting changes with zero semantic delta, skip with: `[auto-review] 포맷팅/자동생성/lockfile 변경이라 리뷰를 생략합니다`
+   - **Skip rule C — Already-reviewed follow-up with identical scope**: If the current session already contains a recent auto-review pass for the same effective diff, compare the current scoped changed files to the previous review pass in the conversation. If the file set is identical (same paths, same effective diff content) and the previous pass produced no Critical findings, skip with: `[auto-review] 이전 pass와 변경 범위가 동일하고 Critical 이슈가 없어 추가 리뷰를 생략합니다`
+   - **Skip rule D — Committed bookkeeping**: If the trigger contains a committed clean-worktree range, apply the committed-range bookkeeping guard above. If confidence is high that the range was already reviewed/fixed in this session, skip with: `[auto-review] 이미 리뷰된 변경의 commit/release 후속 작업이라 추가 리뷰를 생략합니다`
+6. Only proceed to reviewer fanout when **none** of the skip rules apply and there is a concrete, non-trivial code change to inspect inside the current worktree scope. For no-target, trivial-only, or identical follow-up cases, prefer skipping rather than speculative review; for uncertain committed ranges, follow the committed-range guard above and proceed with review when confidence to skip is not high.
+7. Determine the effective `pi-auto-review` config before fanout/fixer orchestration. Merge precedence is `defaults < global config (~/.pi/agent/extensions/auto-review/config.json) < project config (.pi/extensions/auto-review/config.json)`. Apply the same normalization as the extension: ignore unknown keys; ignore invalid or missing values and keep the lower-priority/default value; ignore empty `reviewerAgent`/`fixerAgent`; require booleans to be actual booleans; require positive numbers where numeric; require `reviewConcurrency` to be a positive integer capped at `8` and defaulting to `4`; require `maxReviewPasses` to be `null` or a positive integer; require `reviewerSkills`/`fixerSkills` to be string arrays in JSON config (the `/auto-review config set ...Skills a b` command accepts space-separated input because it writes an array); require `reviewerProfiles` to be a JSON array of objects with non-empty `id` and optional `agent`, `model`, `skills`, `task`, `taskExtra`, `label`, and boolean `enabled`. Merge `reviewerProfiles` by `id` across global and project config so project profiles can override fields, add fields, inherit omitted fields, or set `enabled: false` for global profiles. A project override may omit `task` to inherit a global profile task by id. A new enabled profile needs a non-empty `task` before it can create a standalone reviewer task. Do not treat `null` or empty strings as an unset mechanism for inherited optional profile fields such as `agent`, `model`, `label`, `task`, `taskExtra`, or `skills`; null-clearing is not supported in this pass. Defaults are:
    - `enabled: true`
    - `reviewerAgent: "reviewer"`
    - `reviewerSkills: []`
@@ -30,7 +35,7 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
    - `blockInputDuringReview: true`
    - `reviewStartWatchdogMs: 30000`
    - `maxReviewPasses: null`
-7. Build a **flat parallel reviewer fanout**. Do not create nested subagent fanout from a reviewer.
+8. Build a **flat parallel reviewer fanout**. Do not create nested subagent fanout from a reviewer.
    - If `includeBaselineReview` is not `false`, include **three separate baseline reviewer tasks by default**, even when no `reviewerSkills` are configured:
      1. correctness/regressions/edge cases/unintended side effects;
      2. tests/validation/build confidence and missing verification;
@@ -45,29 +50,33 @@ Use this workflow when `pi-auto-review` asks you to review recent code changes.
      - fallback label: `[auto-review:fallback-correctness]`.
    - Put the label at the very start of the task text and require the reviewer to start its response with `Reviewer: <same-label>`. This does not rename the subagent, but it makes task previews and returned results distinguishable.
    - Include `Expected Loaded Skills: <skill-list-or-none>` in every reviewer task and require the reviewer response to include `Loaded Skills: <same-skill-list-or-none>` immediately after the `Reviewer:` line. Use `none` for baseline/fallback reviewers, `profile.skills` for profile reviewers when non-empty, and the single configured skill name for `reviewerSkills` tasks. This is an audit marker for whether the intended skill injection was requested.
-   - When a committed clean-worktree range is present, include `Review target: committed range <before>..<after>` in every reviewer task and tell reviewers to inspect that range directly.
+   - Set `cwd: reviewCwd` on every reviewer task item so the subagent process starts in the current worktree root, not the parent repository or another nested worktree.
+   - In every reviewer task, include that the review scope is `reviewCwd` only: if `reviewCwd` itself is under a parent `.worktree/<name>` path, that selected worktree is in scope; exclude only nested `.worktree/**` directories inside `reviewCwd` with root-relative pathspecs.
+   - When a committed clean-worktree range is present, include `Review target: committed range <before>..<after>` in every reviewer task and tell reviewers to inspect that range directly. If an `Incremental range since last review:` is also present, prefer that incremental range for follow-up pass reviewer tasks so reviewers inspect only the newly introduced commits.
    - Append `reviewerTaskExtra` to every reviewer task when non-empty.
-8. Run reviewer tasks with `subagent({ tasks: [...], concurrency, context: "fresh" })`.
+9. Run reviewer tasks with `subagent({ tasks: [...], concurrency, context: "fresh" })`.
    - Use `concurrency: reviewConcurrency` (configured values are bounded to a maximum of 8).
    - A single `subagent` parallel call supports at most 8 task items. If the flat reviewer list has more than 8 tasks, split it into sequential batches of at most 8 tasks, wait for each batch, then synthesize all batch results together before deciding on fixes.
    - For reviewer profile tasks, include the `model` field only when profile `model` is non-empty.
    - Every reviewer task must say: `Do not modify project/source files; returning findings in your response is allowed.`
    - Ask reviewers to inspect the actual current diff/changed files directly, not just prior summaries.
+   - In follow-up review passes, instruct reviewers to prioritize newly introduced changes or unresolved prior findings. If only the baseline correctness reviewer is kept for a follow-up pass, focus its task on validating the auto-fix delta rather than repeating the full original scope.
    - Ask reviewers to return `Reviewer: <label>`, `Loaded Skills: <skill-list-or-none>`, `Critical`, `Warnings`, `Suggestions`, and `Files Reviewed` with file/line evidence where possible.
-9. Wait for all reviewer results, then synthesize them in the main session.
+10. Wait for all reviewer results, then synthesize them in the main session.
    - Deduplicate overlapping findings.
    - Separate `Critical`, `Warnings`, `Suggestions`, and feedback to ignore/defer.
    - Treat Suggestions as report-only unless `autoFixSuggestions: true`.
-10. The main session is the orchestrator/synthesizer, not the writer. Do **not** directly edit, write, or run mutating commands for fixes.
-11. If fixes are allowed (`autoFix: true`) and the synthesized results contain Critical or Warning findings, call exactly one fixer subagent using `fixerAgent`.
+11. The main session is the orchestrator/synthesizer, not the writer. Do **not** directly edit, write, or run mutating commands for fixes.
+12. If fixes are allowed (`autoFix: true`) and the synthesized results contain Critical or Warning findings, call exactly one fixer subagent using `fixerAgent`.
    - Pass only accepted Critical/Warning fixes.
    - Include Suggestions only when `autoFixSuggestions: true` and they are safe, local, and inside the approved scope.
    - Pass `skill: fixerSkills` when configured.
+   - Set `cwd: reviewCwd` on the fixer subagent call so writes are constrained to the current worktree root.
    - Append `fixerTaskExtra` when non-empty.
    - The fixer is the only writer for this auto-review pass.
-12. Wait for the fixer result. It must report changed files, fixes applied, validation commands/results, failures, remaining risks, and any decisions that need approval.
-13. Do not continue iterative improvement beyond concrete accepted fixes in this pass. If the fixer changes files, `pi-auto-review` may queue another pass according to `maxReviewPasses`.
-14. If fixes are disabled (`autoFix: false`) or there are no Critical/Warning findings, summarize the review and do not edit files.
+13. Wait for the fixer result. It must report changed files, fixes applied, validation commands/results, failures, remaining risks, and any decisions that need approval.
+14. Do not continue iterative improvement beyond concrete accepted fixes in this pass. If the fixer changes files, `pi-auto-review` may queue another pass according to `maxReviewPasses`.
+15. If fixes are disabled (`autoFix: false`) or there are no Critical/Warning findings, summarize the review and do not edit files.
 
 ## Reviewer Fanout Task Shape
 
@@ -78,30 +87,35 @@ subagent({
   tasks: [
     {
       agent: reviewerAgent,
-      task: "[auto-review:correctness]\nStart your response with:\nReviewer: [auto-review:correctness]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for correctness, regressions, edge cases, and unintended side effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      cwd: reviewCwd,
+      task: "[auto-review:correctness]\nStart your response with:\nReviewer: [auto-review:correctness]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview scope: reviewCwd only. If reviewCwd itself is under a parent .worktree/<name>, that selected worktree is in scope; exclude only nested .worktree/** inside reviewCwd. Review the current diff for correctness, regressions, edge cases, and unintended side effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
-      task: "[auto-review:validation]\nStart your response with:\nReviewer: [auto-review:validation]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for tests, validation quality, build confidence, and missing verification. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      cwd: reviewCwd,
+      task: "[auto-review:validation]\nStart your response with:\nReviewer: [auto-review:validation]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview scope: reviewCwd only. If reviewCwd itself is under a parent .worktree/<name>, that selected worktree is in scope; exclude only nested .worktree/** inside reviewCwd. Review the current diff for tests, validation quality, build confidence, and missing verification. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
-      task: "[auto-review:maintainability]\nStart your response with:\nReviewer: [auto-review:maintainability]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview the current diff for simplicity, maintainability, API clarity, naming, and code organization. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      cwd: reviewCwd,
+      task: "[auto-review:maintainability]\nStart your response with:\nReviewer: [auto-review:maintainability]\nLoaded Skills: none\n\nExpected Loaded Skills: none\nReview scope: reviewCwd only. If reviewCwd itself is under a parent .worktree/<name>, that selected worktree is in scope; exclude only nested .worktree/** inside reviewCwd. Review the current diff for simplicity, maintainability, API clarity, naming, and code organization. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: "frontend-reviewer",
+      cwd: reviewCwd,
       model: "openai-codex/gpt-5.5",
       skill: ["frontend-review"],
-      task: "[auto-review:profile:frontend-performance]\nStart your response with:\nReviewer: [auto-review:profile:frontend-performance]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview the current diff with the configured profile role: focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:profile:frontend-performance]\nStart your response with:\nReviewer: [auto-review:profile:frontend-performance]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview scope: reviewCwd only. If reviewCwd itself is under a parent .worktree/<name>, that selected worktree is in scope; exclude only nested .worktree/** inside reviewCwd. Review the current diff with the configured profile role: focus on frontend performance, rendering cost, unnecessary re-renders, and expensive effects. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     },
     {
       agent: reviewerAgent,
+      cwd: reviewCwd,
       skill: ["frontend-review"],
-      task: "[auto-review:skill:frontend-review]\nStart your response with:\nReviewer: [auto-review:skill:frontend-review]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview the current diff from the frontend-review perspective: React, UI behavior, UX, accessibility, styling, component state, and user interactions. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
+      task: "[auto-review:skill:frontend-review]\nStart your response with:\nReviewer: [auto-review:skill:frontend-review]\nLoaded Skills: frontend-review\n\nExpected Loaded Skills: frontend-review\nReview scope: reviewCwd only. If reviewCwd itself is under a parent .worktree/<name>, that selected worktree is in scope; exclude only nested .worktree/** inside reviewCwd. Review the current diff from the frontend-review perspective: React, UI behavior, UX, accessibility, styling, component state, and user interactions. Do not modify project/source files; returning findings in your response is allowed. Return Critical, Warnings, Suggestions, and Files Reviewed with file/line evidence.",
       output: false
     }
   ],
@@ -117,6 +131,7 @@ Use this pattern only after synthesizing accepted fixes:
 ```typescript
 subagent({
   agent: fixerAgent,
+  cwd: reviewCwd,
   // Include this field only when fixerSkills is non-empty:
   // skill: fixerSkills,
   task: "Apply only the accepted auto-review fixes below. You are the sole writer for this pass. Preserve user-approved scope. Do not fix Suggestions unless explicitly listed. Do not spawn subagents. Run focused validation when possible and report changed files, fixes applied, validation commands/results, failures, remaining risks, and decisions needing approval.\n\nAccepted fixes:\n...",

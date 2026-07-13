@@ -37,6 +37,10 @@ async function flushQueuedReview(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function gitSubcommand(args: string[]): string | undefined {
+  return args[0] === '-C' ? args[2] : args[0];
+}
+
 const tempDirs: string[] = [];
 let hadOriginalSubagentChildEnv = false;
 let originalSubagentChildEnv: string | undefined;
@@ -168,12 +172,45 @@ describe('autoReviewExtension', () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
   });
 
+  it('resets follow-up review state across session_shutdown and session_start', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    const firstPrompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(firstPrompt).not.toContain('Review pass: 2 (follow-up)');
+
+    // Simulate session shutdown + new session start
+    await pi.handlers.session_shutdown[0]({}, ctx);
+    await pi.handlers.session_start[0]({}, ctx);
+
+    // Queue another review in the new session
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const secondPrompt = pi.sendUserMessage.mock.calls[1][0] as string;
+    expect(secondPrompt).not.toContain('Review pass: 2 (follow-up)');
+    expect(secondPrompt).not.toContain('Incremental range since last review');
+  });
+
   it('queues a main-agent follow-up review when files changed', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -189,6 +226,240 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('uses top-level pathspecs with git -C ctx.cwd so subdirectory sessions still review the full current worktree', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    ctx.cwd = '/repo/packages/app';
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--cached', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('does not queue review for nested .worktree-only changes', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M .worktree/feature/src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('scopes review to the worktree root of an edited nested worktree file', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    const repo = createTempDir();
+    const featureRoot = path.join(repo, '.worktree', 'feature');
+    fs.mkdirSync(path.join(featureRoot, 'src'), { recursive: true });
+    ctx.cwd = repo;
+    let featureStatusCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      const cwd = args[0] === '-C' ? args[1] : ctx.cwd;
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
+        return { stdout: cwd?.includes(featureRoot) ? `${featureRoot}\n` : `${repo}\n`, stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        if (cwd === featureRoot) {
+          featureStatusCalls += 1;
+          return { stdout: featureStatusCalls >= 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
+        }
+        return { stdout: ' M main.ts\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_call[0]({ toolName: 'edit', input: { path: '.worktree/feature/src/index.ts' } }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', input: { path: '.worktree/feature/src/index.ts' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toContain(`Review worktree root: ${featureRoot}`);
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', featureRoot, 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).not.toHaveBeenCalledWith('git', ['-C', repo, 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('queues committed clean-worktree review for writes under non-existing directories', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let headCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      const cwd = args[0] === '-C' ? args[1] : ctx.cwd;
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
+        return cwd === '/repo' ? { stdout: '/repo\n', stderr: '', code: 0 } : { stdout: '', stderr: 'not a git repository', code: 128 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        return cwd === '/repo' ? { stdout: '', stderr: '', code: 0 } : { stdout: '', stderr: 'not a git repository', code: 128 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
+        if (cwd !== '/repo') return { stdout: '', stderr: 'not a git repository', code: 128 };
+        headCalls += 1;
+        return { stdout: `${headCalls <= 2 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--name-only')) return { stdout: 'src/index.ts\0', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_call[0]({ toolName: 'write', input: { path: 'new-dir/src/index.ts' } }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'write', input: { path: 'new-dir/src/index.ts' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toContain('Committed clean-worktree range: abc..def');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo', 'diff', '--name-only', '-z', 'abc..def', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('normalizes relative bash cwd before locking review scope', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let featureStatusCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      const cwd = args[0] === '-C' ? args[1] : ctx.cwd;
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
+        return { stdout: cwd === '/repo/.worktree/feature' ? '/repo/.worktree/feature\n' : '/repo\n', stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        if (cwd === '/repo/.worktree/feature') {
+          featureStatusCalls += 1;
+          return { stdout: featureStatusCalls >= 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
+        }
+        return { stdout: ' M main.ts\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'touch src/index.ts', cwd: '.worktree/feature' } }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'touch src/index.ts', cwd: '.worktree/feature' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toContain('Review worktree root: /repo/.worktree/feature');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/.worktree/feature', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('uses git -C from mutating bash commands as the review scope', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let featureStatusCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      const cwd = args[0] === '-C' ? args[1] : ctx.cwd;
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
+        return { stdout: cwd === '/repo/.worktree/feature' ? '/repo/.worktree/feature\n' : '/repo\n', stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        if (cwd === '/repo/.worktree/feature') {
+          featureStatusCalls += 1;
+          return { stdout: featureStatusCalls >= 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
+        }
+        return { stdout: ' M main.ts\n', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'git -C .worktree/feature commit -am fix' } }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'git -C .worktree/feature commit -am fix' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toContain('Review worktree root: /repo/.worktree/feature');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/.worktree/feature', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).not.toHaveBeenCalledWith('git', ['-C', '/repo', 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('resolves repeated git -C options compositionally for mutating bash review scope', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let featureStatusCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      const cwd = args[0] === '-C' ? args[1] : ctx.cwd;
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
+        return { stdout: cwd === '/repo/.worktree/feature' ? '/repo/.worktree/feature\n' : '/repo\n', stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        if (cwd === '/repo/.worktree/feature') {
+          featureStatusCalls += 1;
+          return { stdout: featureStatusCalls >= 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
+        }
+        return { stdout: '', stderr: '', code: 0 };
+      }
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_call[0]({ toolName: 'bash', input: { command: 'git -C .worktree -C feature commit -am x' } }, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'bash', input: { command: 'git -C .worktree -C feature commit -am x' }, isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    const prompt = pi.sendUserMessage.mock.calls[0][0] as string;
+    expect(prompt).toContain('Review worktree root: /repo/.worktree/feature');
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/.worktree/feature', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).not.toHaveBeenCalledWith('git', ['-C', '/repo/.worktree', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.exec).not.toHaveBeenCalledWith('git', ['-C', '/repo', 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+  });
+
+  it('does not let pre-mutation review cwd probes block the user tool call', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) throw new Error('probe failed');
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+
+    await expect(pi.handlers.tool_call[0]({ toolName: 'write', input: { path: 'src/index.ts' } }, ctx)).resolves.toBeUndefined();
   });
 
   it('captures full diff snapshots lazily only when a fixer subagent is about to run', async () => {
@@ -197,9 +468,9 @@ describe('autoReviewExtension', () => {
     let diffCalls = 0;
     let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff')) {
         diffCalls += 1;
         if (!args.includes('--cached')) return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
@@ -238,17 +509,17 @@ describe('autoReviewExtension', () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
   });
 
-  it('queues a compact committed range review prompt for committed clean-worktree changes', async () => {
+  it('queues a compact committed range review prompt for committed clean-worktree current-worktree changes', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     let revParseCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: '', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
         revParseCalls += 1;
         return { stdout: `${revParseCalls === 1 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
       }
-      if (command === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { stdout: 'src/index.ts\0README.md\0', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--name-only')) return { stdout: '.worktree/feature/src/index.ts\0src/index.ts\0', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -263,16 +534,41 @@ describe('autoReviewExtension', () => {
     const prompt = pi.sendUserMessage.mock.calls[0][0];
     expect(prompt).toContain('/skill:auto-review');
     expect(prompt).toContain('Committed clean-worktree range: abc..def');
-    expect(prompt).toContain('Changed files: "README.md", "src/index.ts"');
+    expect(prompt).not.toContain('Changed files:');
     expect(prompt).not.toContain('diff --git');
+  });
+
+  it('does not queue review for committed-only HEAD changes with only nested .worktree files', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let revParseCalls = 0;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
+        revParseCalls += 1;
+        return { stdout: `${revParseCalls === 1 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--name-only')) return { stdout: '.worktree/feature/src/index.ts\0', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'write', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo', 'diff', '--name-only', '-z', 'abc..def', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 
   it('clears queued review state if starting the review turn fails', async () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
     pi.sendUserMessage.mockImplementation(() => {
@@ -292,14 +588,67 @@ describe('autoReviewExtension', () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; state: idle', 'info');
   });
 
+  it('keeps prompts compact after a queued review dispatch fails', async () => {
+    const pi = createFakePi(false);
+    const ctx = createFakeContext();
+    let statusCalls = 0;
+    const heads = ['a', 'a', 'a', 'b', 'b', 'c'];
+    let headIndex = 0;
+    let shouldThrowOnSend = false;
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') {
+        statusCalls += 1;
+        return { stdout: statusCalls === 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
+        const head = heads[headIndex] ?? heads.at(-1) ?? 'c';
+        headIndex += 1;
+        return { stdout: `${head}\n`, stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--name-only')) return { stdout: 'src/commit.ts\0', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+    pi.sendUserMessage.mockImplementation(() => {
+      if (shouldThrowOnSend) throw new Error('send failed');
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    shouldThrowOnSend = true;
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'write', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
+
+    shouldThrowOnSend = false;
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'write', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(3);
+    const prompt = pi.sendUserMessage.mock.calls[2][0] as string;
+    expect(prompt).toContain('Committed clean-worktree range: b..c');
+    expect(prompt).not.toContain('Review pass:');
+    expect(prompt).not.toContain('Incremental range since last review');
+  });
+
   it('clears starting review state if the review turn never starts', async () => {
     vi.useFakeTimers();
     try {
       const pi = createFakePi(false);
       const ctx = createFakeContext();
       pi.exec.mockImplementation(async (command: string, args: string[]) => {
-        if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-        if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
       });
 
@@ -328,8 +677,8 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     ctx.isIdle.mockReturnValue(false);
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -361,8 +710,8 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     ctx.isIdle.mockReturnValue(false);
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -387,8 +736,8 @@ describe('autoReviewExtension', () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -410,11 +759,11 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let statusCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') {
+      if (command === 'git' && gitSubcommand(args) === 'status') {
         statusCalls += 1;
         return { stdout: statusCalls >= 4 ? ' M src/index.ts\n M src/fix.ts\n' : ' M src/index.ts\n', stderr: '', code: 0 };
       }
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -440,8 +789,8 @@ describe('autoReviewExtension', () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -467,9 +816,9 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
         return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
@@ -498,11 +847,11 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let statusCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') {
+      if (command === 'git' && gitSubcommand(args) === 'status') {
         statusCalls += 1;
         return { stdout: statusCalls >= 4 ? ' M src/index.ts\n M generated.ts\n' : ' M src/index.ts\n', stderr: '', code: 0 };
       }
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -529,9 +878,9 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
         return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
@@ -562,9 +911,9 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
         return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
@@ -594,11 +943,11 @@ describe('autoReviewExtension', () => {
     const ctx = createFakeContext();
     let untrackedContentHash = 'old-untracked-hash';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: '?? generated.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff') return { stdout: '', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'ls-files' && args.includes('--others')) return { stdout: 'generated.ts\0', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'hash-object') return { stdout: `${untrackedContentHash}\n`, stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '?? generated.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'ls-files' && args.includes('--others')) return { stdout: 'generated.ts\0', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'hash-object') return { stdout: `${untrackedContentHash}\n`, stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -625,9 +974,9 @@ describe('autoReviewExtension', () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
         return { stdout: 'diff -- unchanged dirty content\n', stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
@@ -660,9 +1009,9 @@ describe('autoReviewExtension', () => {
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ fixerAgent: 'auto-review-fixer' }));
     let currentWorktreeDiff = 'diff -- old content\n';
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'diff' && args.includes('--no-ext-diff') && !args.includes('--cached')) {
         return { stdout: currentWorktreeDiff, stderr: '', code: 0 };
       }
       return { stdout: '', stderr: '', code: 0 };
@@ -697,8 +1046,8 @@ describe('autoReviewExtension', () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -724,8 +1073,8 @@ describe('autoReviewExtension', () => {
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewerAgent: 'custom-reviewer' }));
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -752,8 +1101,8 @@ describe('autoReviewExtension', () => {
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ autoFix: false }));
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -780,8 +1129,8 @@ describe('autoReviewExtension', () => {
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ blockInputDuringReview: false }));
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -804,8 +1153,8 @@ describe('autoReviewExtension', () => {
       fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
       fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: 5000 }));
       pi.exec.mockImplementation(async (command: string, args: string[]) => {
-        if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-        if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
       });
 
@@ -837,8 +1186,8 @@ describe('autoReviewExtension', () => {
       fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
       fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ reviewStartWatchdogMs: 5000 }));
       pi.exec.mockImplementation(async (command: string, args: string[]) => {
-        if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-        if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+        if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
         return { stdout: '', stderr: '', code: 0 };
       });
 
@@ -868,8 +1217,8 @@ describe('autoReviewExtension', () => {
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: true }));
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -892,8 +1241,8 @@ describe('autoReviewExtension', () => {
     fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: true }));
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -1235,8 +1584,8 @@ describe('autoReviewExtension', () => {
     const pi = createFakePi(false);
     const ctx = createFakeContext();
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 
@@ -1262,11 +1611,11 @@ describe('autoReviewExtension', () => {
     fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ maxReviewPasses: 1 }));
     let statusCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
-      if (command === 'git' && args[0] === 'status') {
+      if (command === 'git' && gitSubcommand(args) === 'status') {
         statusCalls += 1;
         return { stdout: statusCalls >= 4 ? ' M src/index.ts\n M src/fix.ts\n' : ' M src/index.ts\n', stderr: '', code: 0 };
       }
-      if (command === 'git' && args[0] === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 0 };
     });
 

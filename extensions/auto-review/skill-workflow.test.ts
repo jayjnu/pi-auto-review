@@ -33,11 +33,17 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('Reviewer: [auto-review:correctness]');
     expect(skill).toContain('Committed clean-worktree range: <before>..<after>');
     expect(skill).toContain('Do **not** dispatch subagents merely because `HEAD` changed');
-    expect(skill).toContain('perform a cheap read-only range inspection such as `git diff --name-only <before>..<after>`');
+    expect(skill).toContain("perform a cheap scoped read-only range inspection such as `git diff --name-only <before>..<after> -- :/ ':(top,exclude).worktree' ':(top,exclude).worktree/**'`");
     expect(skill).toContain('contains no new unreviewed source/config/dependency/docs changes beyond bookkeeping');
     expect(skill).toContain('If confidence is not high, proceed with normal committed-range review');
     expect(skill).toContain('이미 리뷰된 변경의 commit/release 후속 작업이라 추가 리뷰를 생략합니다');
     expect(skill).toContain('Review target: committed range <before>..<after>');
+    expect(skill).toContain('git rev-parse --show-toplevel');
+    expect(skill).toContain("A worktree whose absolute path is itself under a parent repository's `.worktree/<name>` directory is still in scope");
+    expect(skill).toContain('exclude only nested `.worktree/**` directories inside `reviewCwd`');
+    expect(skill).toContain('Set `cwd: reviewCwd` on every reviewer task item');
+    expect(skill).toContain('Set `cwd: reviewCwd` on the fixer subagent call');
+    expect(skill).toContain('cwd: reviewCwd');
   });
 
   it('documents effective config normalization before orchestration', () => {

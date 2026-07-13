@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { getMergedConfig, parseConfigValue } from './config.ts';
-import { AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
+import { AUTO_REVIEW_SKILL_COMMAND, areSkillCommandsEnabled, buildReviewPrompt, filterCurrentWorktreeStatus, isAutoReviewFixerSubagentInput, isFileMutationToolResult, isLikelyMutatingBashCommand, isReadOnlyReviewBashCommand, isReviewerSubagentInput, parseChangedFiles, shouldRunReview } from './helpers.ts';
 
 const tempDirs: string[] = [];
 
@@ -75,6 +75,10 @@ describe('isLikelyMutatingBashCommand', () => {
     expect(isLikelyMutatingBashCommand('echo fix > src/index.ts')).toBe(true);
     expect(isLikelyMutatingBashCommand('rm -rf dist')).toBe(true);
     expect(isLikelyMutatingBashCommand('git commit -am fix')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git -C .worktree/feature commit -am fix')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git -C .worktree/feature add src/index.ts')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git -c user.name=bot -C .worktree/feature commit -am fix')).toBe(true);
+    expect(isLikelyMutatingBashCommand('git --git-dir=.git --work-tree=. add src/index.ts')).toBe(true);
     expect(isLikelyMutatingBashCommand('echo ok && git commit -am fix')).toBe(true);
     expect(isLikelyMutatingBashCommand('git branch new-feature')).toBe(true);
     expect(isLikelyMutatingBashCommand('git tag v1.0.0')).toBe(true);
@@ -88,6 +92,8 @@ describe('isLikelyMutatingBashCommand', () => {
 
   it('does not flag common read-only inspection commands', () => {
     expect(isLikelyMutatingBashCommand('git diff --no-ext-diff')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git -C .worktree/feature diff --no-ext-diff')).toBe(false);
+    expect(isLikelyMutatingBashCommand('git --git-dir .git --work-tree . status --porcelain')).toBe(false);
     expect(isLikelyMutatingBashCommand('git branch --show-current')).toBe(false);
     expect(isLikelyMutatingBashCommand('git branch -a -v')).toBe(false);
     expect(isLikelyMutatingBashCommand("git branch -a 'feature/*'")).toBe(false);
@@ -171,6 +177,39 @@ describe('parseChangedFiles', () => {
     expect(parseChangedFiles(status)).toEqual(['src/index.ts', 'README.md', 'docs/new.md', 'new.ts']);
   });
 
+  it('excludes nested worktree paths from changed files', () => {
+    const status = [' M src/index.ts', ' M .worktree/feature/src/index.ts', '?? .worktree/other/'].join('\n');
+    expect(parseChangedFiles(status)).toEqual(['src/index.ts']);
+  });
+
+  it('filters nested worktree paths from porcelain status', () => {
+    const status = [' M src/index.ts', ' M .worktree/feature/src/index.ts', '?? .worktree/other/'].join('\n');
+    expect(filterCurrentWorktreeStatus(status)).toBe(' M src/index.ts\n');
+  });
+
+  it('keeps rename/copy status lines when either source or target is in the current worktree', () => {
+    const status = [
+      'R  src/a.ts -> .worktree/feature/a.ts',
+      'R  .worktree/feature/b.ts -> src/b.ts',
+      'R  .worktree/feature/c.ts -> .worktree/other/c.ts',
+      'C  src/d.ts -> src/e.ts',
+    ].join('\n');
+
+    expect(filterCurrentWorktreeStatus(status)).toBe([
+      'R  src/a.ts -> .worktree/feature/a.ts',
+      'R  .worktree/feature/b.ts -> src/b.ts',
+      'C  src/d.ts -> src/e.ts',
+    ].join('\n') + '\n');
+    expect(parseChangedFiles(status)).toEqual(['src/a.ts', 'src/b.ts', 'src/e.ts']);
+  });
+
+  it('ignores short malformed status lines', () => {
+    const status = ['M', '?? docs/new.md', ' A'].join('\n');
+
+    expect(filterCurrentWorktreeStatus(status)).toBe('?? docs/new.md\n');
+    expect(parseChangedFiles(status)).toEqual(['docs/new.md']);
+  });
+
   it('returns an empty array for empty status', () => {
     expect(parseChangedFiles('')).toEqual([]);
   });
@@ -233,20 +272,19 @@ describe('buildReviewPrompt', () => {
     expect(prompt).not.toContain('Review pass:');
   });
 
-  it('keeps dirty-worktree review prompts minimal even when HEAD changed', () => {
+  it('keeps dirty-worktree review prompts compact even when changed files are known', () => {
     const prompt = buildReviewPrompt({
-      changedFiles: ['src/index.ts'],
       status: ' M src/index.ts',
       beforeHead: 'abc',
       afterHead: 'def',
     });
 
     expect(prompt).toBe(AUTO_REVIEW_SKILL_COMMAND);
+    expect(prompt).not.toContain('Changed files:');
   });
 
   it('includes compact committed range context for clean-worktree committed changes', () => {
     const prompt = buildReviewPrompt({
-      changedFiles: ['src/index.ts', 'README.md', 'src/index.ts'],
       status: '',
       beforeHead: 'abc',
       afterHead: 'def',
@@ -255,9 +293,10 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain(AUTO_REVIEW_SKILL_COMMAND);
     expect(prompt).toContain('Auto-review context:');
     expect(prompt).toContain('Committed clean-worktree range: abc..def');
-    expect(prompt).toContain('Changed files: "README.md", "src/index.ts"');
+    expect(prompt).not.toContain('Changed files:');
     expect(prompt).not.toContain('diff --git');
   });
+
 });
 
 describe('getMergedConfig', () => {

@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.6.0 - 2026-07-13
+
+### Added
+- Reviewer and fixer tasks now set `cwd: reviewCwd` so subagent processes start in the selected worktree root instead of the parent repository or a sibling nested worktree.
+- The auto-review skill constrains review scope to the selected worktree root (`reviewCwd`) and excludes nested `.worktree/**` directories inside it via root-relative Git pathspecs (`:(top,exclude).worktree`).
+- Mandatory review-worthiness gate with explicit skip rules (no meaningful diff, trivial/lockfile/auto-generated only, already-reviewed identical scope, committed bookkeeping) before dispatching any subagent.
+- Follow-up pass optimization: reviewers prioritize newly introduced changes or unresolved prior findings; identical-scope follow-ups reduce to the baseline correctness reviewer only.
+- Incremental range support for follow-up reviewer tasks when an `Incremental range since last review:` is present.
+
+### Changed
+- `parseChangedFiles` now filters nested `.worktree/` paths so parallel worktree directories do not leak into the changed-files list.
+- `isLikelyMutatingBashCommand` now detects git commands prefixed with `-C`, `--git-dir`, `--work-tree`, and `-c` flags (both mutating and read-only variants).
+- Dirty-worktree review prompts no longer inline `changedFiles`; the skill derives changed files itself via scoped read-only git commands.
+- Renumbered and clarified the auto-review skill Required Flow steps.
+
+### Validation
+- `npm test` — 114 tests passed.
+- `npm run typecheck` — passed.
+- `git diff --check` — passed.
+
 ## v0.5.1 - 2026-06-04
 
 ### Added

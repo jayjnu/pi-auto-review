@@ -17,10 +17,11 @@ export interface ReviewPromptInput {
   status: string;
   beforeHead?: string;
   afterHead?: string;
-  changedFiles?: string[];
+  reviewCwd?: string;
 }
 
 export const AUTO_REVIEW_SKILL_COMMAND = '/skill:auto-review';
+export const CURRENT_WORKTREE_PATHSPECS = [':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'];
 
 const READ_ONLY_REVIEW_COMMANDS = new Set(['pwd', 'ls', 'grep', 'rg', 'cat', 'head', 'tail', 'wc']);
 
@@ -84,19 +85,78 @@ export function isLikelyMutatingBashCommand(command: string): boolean {
   if (!trimmed) return false;
   if (hasShellMetaOutsideQuotes(trimmed, (char, quote) => quote === undefined && /[><;&|]/.test(char))) return true;
 
-  const [binary = ''] = trimmed.split(/\s+/, 1);
+  const tokens = splitSimpleCommand(trimmed);
+  const [binary = ''] = tokens;
   if (['rm', 'mv', 'cp', 'touch', 'mkdir', 'rmdir', 'ln', 'chmod', 'chown', 'tee'].includes(binary)) return true;
   if (binary === 'sed' && /(?:^|\s)(?:--in-place(?:=\S*)?|-i(?:\S*|\s|$))/.test(trimmed)) return true;
   if (binary === 'find' && /(?:^|\s)-(?:delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls|chmod|chown)\b/.test(trimmed)) return true;
   if (binary === 'git') {
-    if (/^git\s+(?:branch|tag)\b/.test(trimmed)) return !isReadOnlyReviewBashCommand(trimmed);
-    return /^git\s+(?:add|am|apply|checkout|cherry-pick|clean|commit|merge|mv|rebase|reset|restore|rm|stash|switch)\b/.test(trimmed);
+    const git = parseGitCommand(tokens);
+    if (!git) return false;
+    if (git.subcommand === 'branch') return !isReadOnlyGitBranch(git.rest.join(' '));
+    if (git.subcommand === 'tag') return !isReadOnlyGitTag(git.rest.join(' '));
+    return ['add', 'am', 'apply', 'checkout', 'cherry-pick', 'clean', 'commit', 'merge', 'mv', 'rebase', 'reset', 'restore', 'rm', 'stash', 'switch'].includes(git.subcommand);
   }
   if (['npm', 'pnpm', 'yarn', 'bun'].includes(binary)) {
-    const subcommand = trimmed.slice(binary.length).trim().split(/\s+/, 1)[0] ?? '';
+    const subcommand = tokens[1] ?? '';
     return ['add', 'install', 'i', 'remove', 'rm', 'update', 'upgrade', 'dedupe', 'prune'].includes(subcommand);
   }
   return false;
+}
+
+function splitSimpleCommand(command: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let quote: 'single' | 'double' | undefined;
+  let escaped = false;
+
+  for (const char of command) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === "'" && quote !== 'double') {
+      quote = quote === 'single' ? undefined : 'single';
+      continue;
+    }
+    if (char === '"' && quote !== 'single') {
+      quote = quote === 'double' ? undefined : 'double';
+      continue;
+    }
+    if (/\s/.test(char) && quote === undefined) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaped) current += '\\';
+  if (current.length > 0) tokens.push(current);
+  return tokens;
+}
+
+function parseGitCommand(tokens: string[]): { subcommand: string; rest: string[] } | undefined {
+  if (tokens[0] !== 'git') return undefined;
+
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? '';
+    if (token === '-C' || token === '-c' || token === '--git-dir' || token === '--work-tree') {
+      index += 1;
+      continue;
+    }
+    if (token.startsWith('--git-dir=') || token.startsWith('--work-tree=')) continue;
+    return { subcommand: token, rest: tokens.slice(index + 1) };
+  }
+
+  return undefined;
 }
 
 function hasShellMetaOutsideQuotes(command: string, isUnsafe: (char: string, quote: 'single' | 'double' | undefined) => boolean): boolean {
@@ -229,16 +289,37 @@ export function isReadOnlyReviewBashCommand(command: string): boolean {
   return READ_ONLY_REVIEW_COMMANDS.has(binary);
 }
 
+export function isCurrentWorktreeReviewFile(file: string): boolean {
+  return file !== '.worktree' && !file.startsWith('.worktree/');
+}
+
+function parseStatusLineFiles(line: string): string[] {
+  if (line.length < 3) return [];
+  const pathPart = line.slice(3).trim();
+  return pathPart.split(' -> ').map((file) => file.trim()).filter((file) => file.length > 0);
+}
+
+function parseStatusLineReviewFile(line: string): string {
+  const files = parseStatusLineFiles(line);
+  const target = files.at(-1) ?? '';
+  if (isCurrentWorktreeReviewFile(target)) return target;
+  return files.find(isCurrentWorktreeReviewFile) ?? '';
+}
+
+export function filterCurrentWorktreeStatus(status: string): string {
+  const lines = status
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0 && parseStatusLineFiles(line).some(isCurrentWorktreeReviewFile));
+  return lines.length > 0 ? `${lines.join('\n')}\n` : '';
+}
+
 export function parseChangedFiles(status: string): string[] {
-  return status
+  return filterCurrentWorktreeStatus(status)
     .split('\n')
     .map((line) => line.trimEnd())
     .filter((line) => line.trim().length > 0)
-    .map((line) => {
-      const pathPart = line.slice(3).trim();
-      const renameTarget = pathPart.split(' -> ').at(-1);
-      return renameTarget ?? pathPart;
-    })
+    .map(parseStatusLineReviewFile)
     .filter((file) => file.length > 0);
 }
 
@@ -256,21 +337,23 @@ export function shouldRunReview(input: ReviewDecisionInput): boolean {
 }
 
 export function buildReviewPrompt(input?: ReviewPromptInput): string {
-  const beforeHead = input?.beforeHead?.trim() ?? '';
-  const afterHead = input?.afterHead?.trim() ?? '';
+  if (!input) return AUTO_REVIEW_SKILL_COMMAND;
+
+  const beforeHead = input.beforeHead?.trim() ?? '';
+  const afterHead = input.afterHead?.trim() ?? '';
+  const reviewCwd = input.reviewCwd?.trim() ?? '';
   const isCommittedCleanWorktree = beforeHead.length > 0
     && afterHead.length > 0
     && beforeHead !== afterHead
-    && (input?.status ?? '').trim().length === 0;
+    && (input.status ?? '').trim().length === 0;
 
-  if (!isCommittedCleanWorktree) return AUTO_REVIEW_SKILL_COMMAND;
+  if (!isCommittedCleanWorktree && reviewCwd.length === 0) return AUTO_REVIEW_SKILL_COMMAND;
 
-  const changedFiles = Array.from(new Set(input?.changedFiles ?? []))
-    .filter((file) => file.length > 0)
-    .sort();
-  const filesLine = changedFiles.length > 0
-    ? `\nChanged files: ${changedFiles.map((file) => JSON.stringify(file)).join(', ')}`
-    : '';
+  const contextLines = [
+    'Auto-review context:',
+    ...(reviewCwd.length > 0 ? [`Review worktree root: ${reviewCwd}`] : []),
+    ...(isCommittedCleanWorktree ? [`Committed clean-worktree range: ${beforeHead}..${afterHead}`] : []),
+  ];
 
-  return `${AUTO_REVIEW_SKILL_COMMAND}\n\nAuto-review context:\nCommitted clean-worktree range: ${beforeHead}..${afterHead}${filesLine}`;
+  return `${AUTO_REVIEW_SKILL_COMMAND}\n\n${contextLines.join('\n')}`;
 }
