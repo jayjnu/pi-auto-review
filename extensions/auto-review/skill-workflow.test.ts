@@ -62,5 +62,8 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('replaces the project-level `reviewerProfiles` array');
     expect(skill).toContain('do not append to or patch the existing scoped list');
     expect(skill).toContain('space-separated input because it writes an array');
+    expect(skill).toContain('use it directly as the already-merged, already-filtered config');
+    expect(skill).toContain('the extension filtered `enabled: false` profiles in code');
+    expect(skill).toContain('The extension also strips them at the `tool_call` level');
   });
 });

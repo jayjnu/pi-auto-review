@@ -248,7 +248,7 @@ describe('autoReviewExtension', () => {
 
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
   });
 
@@ -269,7 +269,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--cached', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
@@ -341,9 +341,11 @@ describe('autoReviewExtension', () => {
       if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--show-toplevel')) {
         return cwd === '/repo' ? { stdout: '/repo\n', stderr: '', code: 0 } : { stdout: '', stderr: 'not a git repository', code: 128 };
       }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
       if (command === 'git' && gitSubcommand(args) === 'status') {
         return cwd === '/repo' ? { stdout: '', stderr: '', code: 0 } : { stdout: '', stderr: 'not a git repository', code: 128 };
       }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
       if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
         if (cwd !== '/repo') return { stdout: '', stderr: 'not a git repository', code: 128 };
         headCalls += 1;
@@ -538,6 +540,7 @@ describe('autoReviewExtension', () => {
     let revParseCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
       if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
         revParseCalls += 1;
         return { stdout: `${revParseCalls === 1 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
@@ -567,6 +570,7 @@ describe('autoReviewExtension', () => {
     let revParseCalls = 0;
     pi.exec.mockImplementation(async (command: string, args: string[]) => {
       if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: '', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
       if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
         revParseCalls += 1;
         return { stdout: `${revParseCalls === 1 ? 'abc' : 'def'}\n`, stderr: '', code: 0 };
@@ -623,6 +627,7 @@ describe('autoReviewExtension', () => {
         statusCalls += 1;
         return { stdout: statusCalls === 2 ? ' M src/index.ts\n' : '', stderr: '', code: 0 };
       }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
       if (command === 'git' && gitSubcommand(args) === 'rev-parse') {
         const head = heads[headIndex] ?? heads.at(-1) ?? 'c';
         headIndex += 1;
@@ -805,7 +810,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
+    expect(pi.sendUserMessage.mock.calls[1][0]).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
   });
 
   it('does not queue another review for an identical already-queued fingerprint', async () => {
@@ -893,7 +898,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
+    expect(pi.sendUserMessage.mock.calls[1][0]).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
   });
 
   it('queues another review after the configured fixer subagent changes same-file diff content', async () => {
@@ -1088,7 +1093,7 @@ describe('autoReviewExtension', () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('loads config while keeping the dispatched prompt minimal', async () => {
+  it('loads config and passes effective config inline in the dispatched prompt', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();
     const ctx = createFakeContext();
@@ -1108,12 +1113,135 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
     const prompt = pi.sendUserMessage.mock.calls[0][0];
-    expect(prompt).toBe('/skill:auto-review');
+    expect(prompt).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
+    expect(prompt).toContain('"reviewerAgent": "custom-reviewer"');
 
     await pi.handlers.before_agent_start[0]({ prompt }, ctx);
     await pi.handlers.agent_start[0]({}, ctx);
     expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'custom-reviewer' } }, ctx)).toBeUndefined();
     expect(await pi.handlers.tool_call[0]({ toolName: 'subagent', input: { agent: 'reviewer' } }, ctx)).toBeUndefined();
+  });
+
+  it('reloads config at agent_end so direct file edits take effect without /auto-review config set', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    const configPath = path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ enabled: true }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) return { stdout: '', stderr: '', code: 1 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+
+    // First turn: review is enabled, should queue
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // Disable via direct file edit (not /auto-review config set)
+    fs.writeFileSync(configPath, JSON.stringify({ enabled: false }));
+
+    // Second turn: review should be disabled, should NOT queue
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('finds project config in main repo via git-common-dir for linked worktrees outside the repo tree', async () => {
+    const pi = createFakePi(false);
+    const repo = createTempDir();
+    const worktree = createTempDir(); // completely separate path
+    const ctx = createFakeContext();
+    ctx.cwd = worktree;
+    const configPath = path.join(repo, '.pi', 'extensions', 'auto-review', 'config.json');
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ enabled: false }));
+    pi.exec.mockImplementation(async (command: string, args: string[]) => {
+      if (command === 'git' && gitSubcommand(args) === 'status') return { stdout: ' M src/index.ts\n', stderr: '', code: 0 };
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse' && args.includes('--git-common-dir')) {
+        // Simulate linked worktree: common-dir points to main repo's .git
+        return { stdout: `${path.join(repo, '.git')}\n`, stderr: '', code: 0 };
+      }
+      if (command === 'git' && gitSubcommand(args) === 'rev-parse') return { stdout: 'abc\n', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
+    });
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+    await pi.handlers.agent_start[0]({}, ctx);
+    await pi.handlers.tool_result[0]({ toolName: 'edit', isError: false }, ctx);
+    await pi.handlers.agent_end[0]({}, ctx);
+    await flushQueuedReview();
+    // Config found via --git-common-dir says enabled: false, so no review should queue
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it('strips disabled reviewer profiles from subagent tasks at tool_call level', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'keep-me', agent: 'reviewer', task: 'keep this reviewer', enabled: true },
+        { id: 'disabled-one', agent: 'disabled-reviewer', task: 'should not dispatch', enabled: false },
+      ],
+    }));
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+
+    const input: Record<string, unknown> = {
+      tasks: [
+        { agent: 'reviewer', task: '[auto-review:profile:keep-me]\nReview stuff.' },
+        { agent: 'disabled-reviewer', task: '[auto-review:profile:disabled-one]\nReview stuff.' },
+      ],
+    };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input }, ctx);
+
+    const tasks = (input.tasks as unknown[]);
+    expect(tasks).toHaveLength(1);
+    expect((tasks[0] as { task: string }).task).toContain('keep-me');
+    expect(tasks.some((t) => typeof (t as { task?: string }).task === 'string' && (t as { task: string }).task.includes('disabled-one'))).toBe(false);
+  });
+
+  it('does not strip tasks based on custom labels of disabled profiles at tool_call level', async () => {
+    const pi = createFakePi(false);
+    const dir = createTempDir();
+    const ctx = createFakeContext();
+    ctx.cwd = dir;
+    fs.mkdirSync(path.join(dir, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({
+      reviewerProfiles: [
+        { id: 'custom-label-disabled', agent: 'reviewer', task: 'should not dispatch', label: 'short', enabled: false },
+      ],
+    }));
+
+    autoReviewExtension(pi as never);
+    await pi.handlers.session_start[0]({}, ctx);
+
+    const input: Record<string, unknown> = {
+      tasks: [
+        { agent: 'reviewer', task: 'short review of something unrelated' },
+        { agent: 'reviewer', task: '[auto-review:correctness]\nReview stuff.' },
+      ],
+    };
+    await pi.handlers.tool_call[0]({ toolName: 'subagent', input }, ctx);
+
+    const tasks = (input.tasks as unknown[]);
+    expect(tasks).toHaveLength(2);
   });
 
   it('does not enforce mutation guard when autoFix is false', async () => {
@@ -1377,7 +1505,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
     await pi.commands['auto-review'].handler('status', ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle; completed passes: 1', 'info');
   });

@@ -304,6 +304,38 @@ describe('buildReviewPrompt', () => {
     expect(prompt).not.toContain('diff --git');
   });
 
+  it('passes effective config inline with enabled:false profiles filtered out', () => {
+    const prompt = buildReviewPrompt({
+      status: ' M src/index.ts',
+      beforeHead: 'abc',
+      afterHead: 'abc',
+      effectiveConfig: {
+        enabled: true,
+        reviewerAgent: 'reviewer',
+        reviewerSkills: [],
+        reviewerTaskExtra: '',
+        reviewerProfiles: [
+          { id: 'keep', agent: 'reviewer', task: 'keep me', enabled: true },
+          { id: 'drop', agent: 'reviewer', task: 'drop me', enabled: false },
+        ],
+        reviewConcurrency: 4,
+        includeBaselineReview: false,
+        fixerAgent: 'worker',
+        fixerSkills: [],
+        fixerTaskExtra: '',
+        autoFix: true,
+        autoFixSuggestions: false,
+        blockInputDuringReview: true,
+        reviewStartWatchdogMs: 30000,
+        maxReviewPasses: null,
+      },
+    });
+
+    expect(prompt).toContain('Effective config:');
+    expect(prompt).toContain('"id": "keep"');
+    expect(prompt).not.toContain('"id": "drop"');
+  });
+
 });
 
 describe('getMergedConfig', () => {
@@ -521,6 +553,31 @@ describe('getMergedConfig', () => {
 
     const config = getMergedConfig(dir, dir);
     expect(config.reviewStartWatchdogMs).toBe(30_000);
+  });
+
+  it('walks up the filesystem to find .pi/ in a parent repo when absent in cwd (gitignored worktree)', () => {
+    const repo = createTempDir();
+    const worktree = path.join(repo, '.worktree', 'feature');
+    fs.mkdirSync(path.join(repo, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: false, reviewerAgent: 'parent-reviewer' }));
+    fs.mkdirSync(worktree, { recursive: true });
+
+    const config = getMergedConfig(worktree, worktree);
+    expect(config.enabled).toBe(false);
+    expect(config.reviewerAgent).toBe('parent-reviewer');
+  });
+
+  it('finds .pi/ in the main repo via projectRoots when worktree is outside the repo tree (linked worktree)', () => {
+    const repo = createTempDir();
+    const worktree = createTempDir(); // completely separate path, not nested under repo
+    fs.mkdirSync(path.join(repo, '.pi', 'extensions', 'auto-review'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.pi', 'extensions', 'auto-review', 'config.json'), JSON.stringify({ enabled: false, reviewerAgent: 'linked-reviewer' }));
+
+    // Filesystem walk-up from worktree would never find repo/.pi/
+    // But passing repo as a projectRoot (as resolveProjectConfigRoots would via --git-common-dir) finds it
+    const config = getMergedConfig(worktree, worktree, [repo]);
+    expect(config.enabled).toBe(false);
+    expect(config.reviewerAgent).toBe('linked-reviewer');
   });
 });
 

@@ -127,8 +127,24 @@ export function readGlobalConfig(homeDir = os.homedir()): AutoReviewConfig {
   return normalizeConfig(loadConfigFile(getGlobalConfigPath(homeDir)));
 }
 
-export function readProjectConfig(cwd: string): AutoReviewConfig {
-  return normalizeConfig(loadConfigFile(getProjectConfigPath(cwd)));
+export function readProjectConfig(cwd: string, extraRoots: string[] = []): AutoReviewConfig {
+  // Check cwd first (worktree-local overrides), then extra roots, then walk up
+  // the filesystem from cwd. This finds .pi/ in the main repo even when .pi/
+  // is gitignored and absent in a worktree (common for .worktree/<name>/ paths).
+  // No git calls — pure filesystem, so it works regardless of worktree linking.
+  const candidates = [cwd, ...extraRoots];
+  let dir = path.resolve(cwd);
+  for (let i = 0; i < 20; i++) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    if (!candidates.includes(parent)) candidates.push(parent);
+    dir = parent;
+  }
+  for (const root of candidates) {
+    const cfg = normalizeConfig(loadConfigFile(getProjectConfigPath(root)));
+    if (Object.keys(cfg).length > 0) return cfg;
+  }
+  return {};
 }
 
 function writeConfigFile(filePath: string, existing: AutoReviewConfig, patch: AutoReviewConfig): void {
@@ -240,9 +256,9 @@ export function getConfigDisplay(merged: Required<AutoReviewConfig>): string {
   return lines.join('\n');
 }
 
-export function getMergedConfig(cwd: string, homeDir = os.homedir()): Required<AutoReviewConfig> {
+export function getMergedConfig(cwd: string, homeDir = os.homedir(), projectRoots?: string[]): Required<AutoReviewConfig> {
   const globalConfig = readGlobalConfig(homeDir);
-  const projectConfig = readProjectConfig(cwd);
+  const projectConfig = readProjectConfig(cwd, projectRoots);
   return {
     ...DEFAULT_CONFIG,
     ...globalConfig,

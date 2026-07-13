@@ -1,6 +1,6 @@
 {
   "name": "@jayjnu/pi-auto-review",
-  "version": "0.6.1",
+  "version": "0.6.3",
   "description": "Pi package that automatically queues a read-only code review after agent code changes.",
   "type": "module",
   "repository": {

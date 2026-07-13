@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.6.3 - 2026-07-13
+
+### Fixed
+- **Config reload at every `agent_end`**: direct file edits to `config.json` (including `enabled: false`) now take effect on the next agent turn without requiring `/auto-review config set`. Previously config was loaded only at `session_start`, so file edits were invisible until restart.
+- **Worktree `.pi/` gitignore support**: Project config is found via `git rev-parse --git-common-dir` (which resolves the main repo root even for linked worktrees living outside the main repo directory tree), with a filesystem walk-up fallback for non-git or error cases. This finds `.pi/` in the main repo even when `.pi/` is gitignored and absent in a worktree.
+- **Extension-level disabled reviewer filtering via `tool_call` interception**: the `tool_call` handler now strips disabled `reviewerProfiles` from `subagent` `tasks` arrays in code, matching by the task label (`[auto-review:profile:<id>]` or custom `label`). This is a safety net on top of the inline `Effective config:` block — it catches manual `/skill:auto-review` turns (no inline config) and LLM hallucination. The LLM can no longer dispatch a disabled reviewer profile regardless of how the review turn was triggered.
+
+## v0.6.2 - 2026-07-13
+
+### Fixed
+- `reviewerProfiles` entries with `enabled: false` are now filtered in code before the review prompt is dispatched, instead of relying on the main agent LLM to read config files and skip them. The extension passes the already-merged, already-filtered effective config inline in the `Auto-review context:` block (as an `Effective config:` JSON block), so disabled profiles are no longer dispatched even when the main agent fails to re-read/merge config correctly (especially in worktree contexts). The skill uses this inline block directly and no longer re-reads config files when it is present.
+
 ## v0.6.1 - 2026-07-13
 
 ### Fixed

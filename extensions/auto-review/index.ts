@@ -178,11 +178,12 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
       // Config subcommand (preserve original case for config keys)
       if (command.startsWith('config')) {
         const sub = parseConfigSubcommand(trimmed);
+        const projectRoots = await resolveProjectConfigRoots(ctx.cwd, ctx.signal);
 
         if (sub.action === 'show') {
-          const merged = getMergedConfig(ctx.cwd);
+          const merged = getMergedConfig(ctx.cwd, undefined, projectRoots);
           const globalConfig = readGlobalConfig();
-          const project = readProjectConfig(ctx.cwd);
+          const project = readProjectConfig(ctx.cwd, projectRoots);
           const lines = sub.scope === 'global'
             ? [
                 'Auto review global configuration:',
@@ -213,7 +214,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
         }
 
         if (sub.action === 'get') {
-          const source = sub.scope === 'global' ? readGlobalConfig() : sub.scope === 'project' ? readProjectConfig(ctx.cwd) : getMergedConfig(ctx.cwd);
+          const source = sub.scope === 'global' ? readGlobalConfig() : sub.scope === 'project' ? readProjectConfig(ctx.cwd, projectRoots) : getMergedConfig(ctx.cwd, undefined, projectRoots);
           ctx.ui.notify(`${sub.key}: ${formatConfigValue(source[sub.key])}`, 'info');
           return;
         }
@@ -225,7 +226,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
             if (sub.scope === 'global') writeGlobalConfig(patch as AutoReviewConfig);
             else writeProjectConfig(ctx.cwd, patch as AutoReviewConfig);
             // Reload config into the active session
-            config = getMergedConfig(ctx.cwd);
+            config = getMergedConfig(ctx.cwd, undefined, projectRoots);
             // Setting `enabled` via config is an explicit persistent intent; clear any
             // session-only runtime override so the new value actually takes effect.
             // Without this, a prior `/auto-review on|off` would shadow `config set enabled`.
@@ -247,7 +248,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
               initProjectConfig(ctx.cwd);
               ctx.ui.notify(`Created project config at ${getProjectConfigPath(ctx.cwd)}`, 'info');
             }
-            config = getMergedConfig(ctx.cwd);
+            config = getMergedConfig(ctx.cwd, undefined, projectRoots);
           } catch (err) {
             ctx.ui.notify(err instanceof Error ? err.message : String(err), 'error');
           }
@@ -303,6 +304,25 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     const result = await pi.exec('git', gitArgs(cwd, ['rev-parse', '--show-toplevel']), { signal });
     const root = result.code === 0 ? result.stdout.trim() : '';
     return path.isAbsolute(root) ? root : cwd;
+  }
+
+  // Find the main repo root via git common-dir. Linked worktrees can live anywhere
+  // on the filesystem (not necessarily nested under the main repo), so filesystem
+  // walk-up alone can't find .pi/ in the main repo when .pi/ is gitignored.
+  // git rev-parse --git-common-dir returns the shared .git dir; its parent is the
+  // main repo root. Returns [] on failure (walk-up in config.ts is the fallback).
+  async function resolveProjectConfigRoots(cwd: string, signal?: AbortSignal): Promise<string[]> {
+    try {
+      const result = await pi.exec('git', gitArgs(cwd, ['rev-parse', '--git-common-dir']), { signal });
+      if (!result || result.code !== 0) return [];
+      const commonDir = result.stdout.trim();
+      if (!commonDir) return [];
+      const absolute = path.isAbsolute(commonDir) ? commonDir : path.resolve(cwd, commonDir);
+      const mainRoot = path.dirname(absolute);
+      return mainRoot && mainRoot !== cwd ? [mainRoot] : [];
+    } catch {
+      return [];
+    }
   }
 
   function getInputCwd(input: Record<string, unknown> | undefined): string | undefined {
@@ -438,7 +458,9 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
   }
 
   pi.on('session_start', async (_event, ctx) => {
-    config = getMergedConfig(ctx?.cwd ?? process.cwd());
+    const cwd = ctx?.cwd ?? process.cwd();
+    const projectRoots = await resolveProjectConfigRoots(cwd).catch(() => []);
+    config = getMergedConfig(cwd, undefined, projectRoots);
     runtimeEnabledOverride = undefined;
     if (ctx?.hasUI && !areSkillCommandsEnabled(ctx.cwd)) {
       ctx.ui.notify('pi-auto-review uses /skill:auto-review, but enableSkillCommands is false. Set "enableSkillCommands": true in ~/.pi/agent/settings.json or .pi/settings.json.', 'warning');
@@ -494,6 +516,28 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     }
 
     if (event.toolName !== 'subagent') return;
+
+    // Extension-level safety net: strip disabled reviewer profiles from parallel
+    // task fanout. The inline Effective config block already hides them from the
+    // LLM, but this catches manual /skill:auto-review turns (no inline config) and
+    // LLM hallucination. Match by the task label the skill requires at task start.
+    if (Array.isArray(input?.tasks) && config) {
+      // Only filter on the default namespace label format. Profiles with a
+      // custom label are skipped here (the inline Effective config block is the
+      // primary filter for those) to avoid stripping unrelated non-reviewer tasks.
+      const disabledLabels = config.reviewerProfiles
+        .filter((p) => p.enabled === false && !p.label)
+        .map((p) => `[auto-review:profile:${p.id}]`);
+      if (disabledLabels.length > 0) {
+        input.tasks = (input.tasks as unknown[]).filter((task) => {
+          const taskText = task && typeof task === 'object' && typeof (task as { task?: unknown }).task === 'string'
+            ? (task as { task: string }).task
+            : '';
+          return !disabledLabels.some((label) => taskText.startsWith(label));
+        });
+      }
+    }
+
     if (!isAutoReviewFixerSubagentInput(input, config?.fixerAgent ?? 'worker')) return;
     await safeLockReviewCwd(resolveAgainstCtxCwd(ctx.cwd, getInputCwd(input)), ctx.cwd, ctx.signal);
     if (capturedFixerDiffSnapshot) return;
@@ -542,6 +586,12 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     // ponytail: best-effort review trigger. If git inspection fails, the review is silently skipped.
     // Ceiling: subprocess failures become invisible. Upgrade path: ctx.ui.notify when diagnosability is needed.
     try {
+      // Reload config so direct file edits (including in worktrees where .pi/ is gitignored)
+      // take effect on the next agent turn without requiring /auto-review config set.
+      // Use git common-dir to find the main repo root for linked worktrees that live
+      // outside the main repo directory tree.
+      const projectRoots = await resolveProjectConfigRoots(ctx.cwd, ctx.signal);
+      config = getMergedConfig(ctx.cwd, undefined, projectRoots);
       const effectiveReviewCwd = reviewCwd || await getWorktreeRoot(ctx.cwd, ctx.signal);
       const [afterStatus, afterHead] = await Promise.all([
         getStatus(effectiveReviewCwd, ctx.signal),
@@ -619,6 +669,7 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
         beforeHead,
         afterHead,
         reviewCwd: effectiveReviewCwd !== ctx.cwd ? effectiveReviewCwd : undefined,
+        effectiveConfig: config,
       });
 
       lastQueuedReviewFingerprint = reviewFingerprint;
