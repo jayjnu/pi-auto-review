@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6.4 - 2026-07-15
+
+### Changed
+- Auto-review prompts no longer inline the effective config JSON; the skill resolves config through its bundled helper script instead.
+- Package the auto-review skill helper script for npm publishes.
+
+### Fixed
+- Disabled reviewer profiles with custom labels are filtered at `tool_call` time.
+- Added helper parity coverage against the TypeScript config merge behavior.
+
 ## v0.6.3 - 2026-07-13
 
 ### Fixed
