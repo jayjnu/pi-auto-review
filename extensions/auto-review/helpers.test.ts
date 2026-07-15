@@ -304,36 +304,17 @@ describe('buildReviewPrompt', () => {
     expect(prompt).not.toContain('diff --git');
   });
 
-  it('passes effective config inline with enabled:false profiles filtered out', () => {
+  it('does not inline effective config in queued prompts', () => {
     const prompt = buildReviewPrompt({
       status: ' M src/index.ts',
       beforeHead: 'abc',
       afterHead: 'abc',
-      effectiveConfig: {
-        enabled: true,
-        reviewerAgent: 'reviewer',
-        reviewerSkills: [],
-        reviewerTaskExtra: '',
-        reviewerProfiles: [
-          { id: 'keep', agent: 'reviewer', task: 'keep me', enabled: true },
-          { id: 'drop', agent: 'reviewer', task: 'drop me', enabled: false },
-        ],
-        reviewConcurrency: 4,
-        includeBaselineReview: false,
-        fixerAgent: 'worker',
-        fixerSkills: [],
-        fixerTaskExtra: '',
-        autoFix: true,
-        autoFixSuggestions: false,
-        blockInputDuringReview: true,
-        reviewStartWatchdogMs: 30000,
-        maxReviewPasses: null,
-      },
+      reviewCwd: '/tmp/repo',
     });
 
-    expect(prompt).toContain('Effective config:');
-    expect(prompt).toContain('"id": "keep"');
-    expect(prompt).not.toContain('"id": "drop"');
+    expect(prompt).toContain('Auto-review context:');
+    expect(prompt).toContain('Review worktree root: /tmp/repo');
+    expect(prompt).not.toContain('Effective config:');
   });
 
 });

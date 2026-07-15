@@ -1,8 +1,6 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import type { AutoReviewConfig } from './config.ts';
-
 export interface ReviewDecisionInput {
   enabled: boolean;
   reviewQueued: boolean;
@@ -19,8 +17,6 @@ export interface ReviewPromptInput {
   beforeHead?: string;
   afterHead?: string;
   reviewCwd?: string;
-  /** Merged effective config; when provided, profiles with enabled:false are filtered in code and the block is passed inline so the skill does not re-read files. */
-  effectiveConfig?: Required<AutoReviewConfig>;
 }
 
 export const AUTO_REVIEW_SKILL_COMMAND = '/skill:auto-review';
@@ -338,32 +334,23 @@ export function shouldRunReview(input: ReviewDecisionInput): boolean {
   return statusChanged || headChanged;
 }
 
-function serializeEffectiveConfig(config: Required<AutoReviewConfig>): string {
-  // blockInputDuringReview and reviewStartWatchdogMs are extension-only controls the skill does not need.
-  const { blockInputDuringReview: _b, reviewStartWatchdogMs: _w, ...rest } = config;
-  const filtered = { ...rest, reviewerProfiles: config.reviewerProfiles.filter((profile) => profile.enabled !== false) };
-  return JSON.stringify(filtered, null, 2);
-}
-
 export function buildReviewPrompt(input?: ReviewPromptInput): string {
   if (!input) return AUTO_REVIEW_SKILL_COMMAND;
 
   const beforeHead = input.beforeHead?.trim() ?? '';
   const afterHead = input.afterHead?.trim() ?? '';
   const reviewCwd = input.reviewCwd?.trim() ?? '';
-  const effectiveConfig = input.effectiveConfig;
   const isCommittedCleanWorktree = beforeHead.length > 0
     && afterHead.length > 0
     && beforeHead !== afterHead
     && (input.status ?? '').trim().length === 0;
 
-  if (!isCommittedCleanWorktree && reviewCwd.length === 0 && !effectiveConfig) return AUTO_REVIEW_SKILL_COMMAND;
+  if (!isCommittedCleanWorktree && reviewCwd.length === 0) return AUTO_REVIEW_SKILL_COMMAND;
 
   const contextLines = [
     'Auto-review context:',
     ...(reviewCwd.length > 0 ? [`Review worktree root: ${reviewCwd}`] : []),
     ...(isCommittedCleanWorktree ? [`Committed clean-worktree range: ${beforeHead}..${afterHead}`] : []),
-    ...(effectiveConfig ? [`Effective config:\n${serializeEffectiveConfig(effectiveConfig)}`] : []),
   ];
 
   return `${AUTO_REVIEW_SKILL_COMMAND}\n\n${contextLines.join('\n')}`;

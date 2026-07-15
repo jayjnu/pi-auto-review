@@ -518,22 +518,20 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
     if (event.toolName !== 'subagent') return;
 
     // Extension-level safety net: strip disabled reviewer profiles from parallel
-    // task fanout. The inline Effective config block already hides them from the
-    // LLM, but this catches manual /skill:auto-review turns (no inline config) and
+    // task fanout. The skill helper filters them before fanout, but this catches
+    // manual /skill:auto-review turns where config was resolved differently and
     // LLM hallucination. Match by the task label the skill requires at task start.
     if (Array.isArray(input?.tasks) && config) {
-      // Only filter on the default namespace label format. Profiles with a
-      // custom label are skipped here (the inline Effective config block is the
-      // primary filter for those) to avoid stripping unrelated non-reviewer tasks.
       const disabledLabels = config.reviewerProfiles
-        .filter((p) => p.enabled === false && !p.label)
-        .map((p) => `[auto-review:profile:${p.id}]`);
+        .filter((p) => p.enabled === false)
+        .map((p) => ({ label: p.label ?? `[auto-review:profile:${p.id}]`, custom: Boolean(p.label) }));
       if (disabledLabels.length > 0) {
         input.tasks = (input.tasks as unknown[]).filter((task) => {
           const taskText = task && typeof task === 'object' && typeof (task as { task?: unknown }).task === 'string'
             ? (task as { task: string }).task
             : '';
-          return !disabledLabels.some((label) => taskText.startsWith(label));
+          const firstLine = taskText.split('\n', 1)[0] ?? '';
+          return !disabledLabels.some(({ label, custom }) => custom ? firstLine === label : taskText.startsWith(label));
         });
       }
     }
@@ -669,7 +667,6 @@ export default function autoReviewExtension(pi: ExtensionAPI) {
         beforeHead,
         afterHead,
         reviewCwd: effectiveReviewCwd !== ctx.cwd ? effectiveReviewCwd : undefined,
-        effectiveConfig: config,
       });
 
       lastQueuedReviewFingerprint = reviewFingerprint;

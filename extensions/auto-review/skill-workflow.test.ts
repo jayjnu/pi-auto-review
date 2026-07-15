@@ -46,24 +46,17 @@ describe('auto-review skill workflow instructions', () => {
     expect(skill).toContain('cwd: reviewCwd');
   });
 
-  it('documents effective config normalization before orchestration', () => {
+  it('documents effective config helper before orchestration', () => {
     const skill = fs.readFileSync(skillPath, 'utf-8');
 
-    expect(skill).toContain('Merge precedence is `defaults < global config');
-    expect(skill).toContain('ignore unknown keys');
-    expect(skill).toContain('ignore invalid or missing values and keep the lower-priority/default value');
-    expect(skill).toContain('ignore empty `reviewerAgent`/`fixerAgent`');
-    expect(skill).toContain('require booleans to be actual booleans');
-    expect(skill).toContain('require `reviewConcurrency` to be a positive integer capped at `8` and defaulting to `4`');
-    expect(skill).toContain('require `reviewerSkills`/`fixerSkills` to be string arrays in JSON config');
-    expect(skill).toContain('require `reviewerProfiles` to be a JSON array of objects');
-    expect(skill).toContain('Merge `reviewerProfiles` by `id`');
-    expect(skill).toContain('Do not treat `null` or empty strings as an unset mechanism');
-    expect(skill).toContain('replaces the project-level `reviewerProfiles` array');
-    expect(skill).toContain('do not append to or patch the existing scoped list');
-    expect(skill).toContain('space-separated input because it writes an array');
-    expect(skill).toContain('use it directly as the already-merged, already-filtered config');
-    expect(skill).toContain('the extension filtered `enabled: false` profiles in code');
+    expect(skill).toContain('cd <auto-review-skill-dir> && node scripts/effective-config.mjs "$reviewCwd"');
+    expect(skill).toContain('Resolve `<auto-review-skill-dir>` as the directory containing this `SKILL.md`');
+    expect(skill).toContain('do not run `node scripts/effective-config.mjs "$reviewCwd"` from the project root');
+    expect(skill).toContain('already-merged, already-filtered JSON config');
+    expect(skill).toContain('defaults < global config');
+    expect(skill).toContain('checks Git common-dir for linked worktrees');
+    expect(skill).toContain('filters out `enabled: false` profiles');
+    expect(skill).toContain('If the helper script cannot be executed, fall back to the same merge rules manually');
     expect(skill).toContain('The extension also strips them at the `tool_call` level');
   });
 });

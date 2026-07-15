@@ -5,7 +5,7 @@
 ### Fixed
 - **Config reload at every `agent_end`**: direct file edits to `config.json` (including `enabled: false`) now take effect on the next agent turn without requiring `/auto-review config set`. Previously config was loaded only at `session_start`, so file edits were invisible until restart.
 - **Worktree `.pi/` gitignore support**: Project config is found via `git rev-parse --git-common-dir` (which resolves the main repo root even for linked worktrees living outside the main repo directory tree), with a filesystem walk-up fallback for non-git or error cases. This finds `.pi/` in the main repo even when `.pi/` is gitignored and absent in a worktree.
-- **Extension-level disabled reviewer filtering via `tool_call` interception**: the `tool_call` handler now strips disabled `reviewerProfiles` from `subagent` `tasks` arrays in code, matching by the task label (`[auto-review:profile:<id>]` or custom `label`). This is a safety net on top of the inline `Effective config:` block — it catches manual `/skill:auto-review` turns (no inline config) and LLM hallucination. The LLM can no longer dispatch a disabled reviewer profile regardless of how the review turn was triggered.
+- **Extension-level disabled reviewer filtering via `tool_call` interception**: the `tool_call` handler now strips disabled `reviewerProfiles` from `subagent` `tasks` arrays in code, matching by the task label (`[auto-review:profile:<id>]` or custom `label`). This is a safety net on top of the skill's effective-config helper — it catches manual `/skill:auto-review` turns and LLM hallucination. The LLM can no longer dispatch a disabled reviewer profile regardless of how the review turn was triggered.
 
 ## v0.6.2 - 2026-07-13
 

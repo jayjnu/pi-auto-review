@@ -248,7 +248,7 @@ describe('autoReviewExtension', () => {
 
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
   });
 
@@ -269,7 +269,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'status', '--porcelain', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
     expect(pi.exec).toHaveBeenCalledWith('git', ['-C', '/repo/packages/app', 'diff', '--cached', '--no-ext-diff', '--', ':/', ':(top,exclude).worktree', ':(top,exclude).worktree/**'], { signal: ctx.signal });
@@ -810,7 +810,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
+    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
   });
 
   it('does not queue another review for an identical already-queued fingerprint', async () => {
@@ -898,7 +898,7 @@ describe('autoReviewExtension', () => {
     await flushQueuedReview();
 
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(2);
-    expect(pi.sendUserMessage.mock.calls[1][0]).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
+    expect(pi.sendUserMessage.mock.calls[1][0]).toBe('/skill:auto-review');
   });
 
   it('queues another review after the configured fixer subagent changes same-file diff content', async () => {
@@ -1093,7 +1093,7 @@ describe('autoReviewExtension', () => {
     expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
   });
 
-  it('loads config and passes effective config inline in the dispatched prompt', async () => {
+  it('loads config without inlining effective config in the dispatched prompt', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();
     const ctx = createFakeContext();
@@ -1113,8 +1113,8 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
     const prompt = pi.sendUserMessage.mock.calls[0][0];
-    expect(prompt).toMatch(/^\/skill:auto-review[\s\S]*Effective config:/);
-    expect(prompt).toContain('"reviewerAgent": "custom-reviewer"');
+    expect(prompt).toBe('/skill:auto-review');
+    expect(prompt).not.toContain('Effective config:');
 
     await pi.handlers.before_agent_start[0]({ prompt }, ctx);
     await pi.handlers.agent_start[0]({}, ctx);
@@ -1217,7 +1217,7 @@ describe('autoReviewExtension', () => {
     expect(tasks.some((t) => typeof (t as { task?: string }).task === 'string' && (t as { task: string }).task.includes('disabled-one'))).toBe(false);
   });
 
-  it('does not strip tasks based on custom labels of disabled profiles at tool_call level', async () => {
+  it('strips exact custom-label tasks for disabled profiles without stripping unrelated prefixes', async () => {
     const pi = createFakePi(false);
     const dir = createTempDir();
     const ctx = createFakeContext();
@@ -1235,6 +1235,7 @@ describe('autoReviewExtension', () => {
     const input: Record<string, unknown> = {
       tasks: [
         { agent: 'reviewer', task: 'short review of something unrelated' },
+        { agent: 'reviewer', task: 'short\nReview stuff.' },
         { agent: 'reviewer', task: '[auto-review:correctness]\nReview stuff.' },
       ],
     };
@@ -1242,6 +1243,8 @@ describe('autoReviewExtension', () => {
 
     const tasks = (input.tasks as unknown[]);
     expect(tasks).toHaveLength(2);
+    expect(tasks.some((t) => (t as { task?: string }).task === 'short\nReview stuff.')).toBe(false);
+    expect(tasks.some((t) => (t as { task?: string }).task === 'short review of something unrelated')).toBe(true);
   });
 
   it('does not enforce mutation guard when autoFix is false', async () => {
@@ -1505,7 +1508,7 @@ describe('autoReviewExtension', () => {
     await pi.handlers.agent_end[0]({}, ctx);
     await flushQueuedReview();
 
-    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringMatching(/^\/skill:auto-review[\s\S]*Effective config:/));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith('/skill:auto-review');
     await pi.commands['auto-review'].handler('status', ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith('Auto review is enabled; enabled (config: enabled=true); state: idle; completed passes: 1', 'info');
   });

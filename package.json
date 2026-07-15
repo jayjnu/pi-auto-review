@@ -18,6 +18,7 @@
     "extensions/auto-review/*.ts",
     "!extensions/auto-review/*.test.ts",
     "skills/**/*.md",
+    "skills/**/*.mjs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
